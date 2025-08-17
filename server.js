@@ -13,10 +13,10 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 const VIDEO_PATH = path.join(__dirname, 's.mp4');
 
-// EXACT COPY of your working version but with 192x144
-const FPS = 10;
-const WIDTH = 192;   // Changed from 160 to 192
-const HEIGHT = 144;  // Changed from 120 to 144
+// PERFORMANCE OPTIMIZED VERSION
+const FPS = 6;  // Reduced from 10 to match cloud performance
+const WIDTH = 160;   // Back to your working 160x120 temporarily  
+const HEIGHT = 120;  // Test if this fixes the speed issue
 
 let currentFrame = 0;
 let videoDuration = 0;
@@ -57,47 +57,62 @@ const getVideoDuration = () => {
     }
 })();
 
-// IDENTICAL background processing from working version - NO CHANGES
-setInterval(() => {
-    if (isProcessing || !videoDuration) return;
-   
-    isProcessing = true;
-    const seekTime = currentFrame / FPS;
-    let pixelBuffer = Buffer.alloc(0);
-   
-    const outputStream = new PassThrough();
-   
-    outputStream.on('data', chunk => {
-        pixelBuffer = Buffer.concat([pixelBuffer, chunk]);
-    });
-   
-    outputStream.on('end', () => {
-        const pixels = [];
-        for (let i = 0; i < pixelBuffer.length; i += 3) {
-            pixels.push([pixelBuffer[i], pixelBuffer[i + 1], pixelBuffer[i + 2]]);
-        }
-        lastPixels = pixels;
-        currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
-        isProcessing = false;
+// CLOUD-OPTIMIZED processing with adaptive timing
+let processingInterval;
+let avgProcessingTime = 200; // Start with 200ms estimate
+
+const startAdaptiveProcessing = () => {
+    const processFrame = () => {
+        if (isProcessing || !videoDuration) return;
        
-        if (currentFrame % (FPS * 5) === 0) {
-            console.log(`Processed frame ${currentFrame} (${seekTime.toFixed(2)}s)`);
-        }
-    });
-   
-    ffmpeg(VIDEO_PATH)
-        .seekInput(seekTime)
-        .frames(1)
-        .size(`${WIDTH}x${HEIGHT}`)
-        .outputOptions('-pix_fmt rgb24')
-        .format('rawvideo')
-        .on('error', (err) => {
-            console.error('FFmpeg error:', err);
+        const frameStart = Date.now();
+        isProcessing = true;
+        const seekTime = currentFrame / FPS;
+        let pixelBuffer = Buffer.alloc(0);
+       
+        const outputStream = new PassThrough();
+       
+        outputStream.on('data', chunk => {
+            pixelBuffer = Buffer.concat([pixelBuffer, chunk]);
+        });
+       
+        outputStream.on('end', () => {
+            const pixels = [];
+            for (let i = 0; i < pixelBuffer.length; i += 3) {
+                pixels.push([pixelBuffer[i], pixelBuffer[i + 1], pixelBuffer[i + 2]]);
+            }
+            lastPixels = pixels;
+            currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
             isProcessing = false;
-        })
-        .pipe(outputStream);
+            
+            const processingTime = Date.now() - frameStart;
+            avgProcessingTime = (avgProcessingTime * 0.9) + (processingTime * 0.1); // Moving average
+            
+            console.log(`✅ Frame ${currentFrame-1}: ${processingTime}ms (avg: ${Math.round(avgProcessingTime)}ms)`);
+            
+            // Adaptive timing - wait for next frame only after processing completes
+            setTimeout(processFrame, Math.max(50, 1000/FPS - processingTime));
+        });
        
-}, 1000 / FPS);
+        ffmpeg(VIDEO_PATH)
+            .seekInput(seekTime)
+            .frames(1)
+            .size(`${WIDTH}x${HEIGHT}`)
+            .outputOptions(['-pix_fmt rgb24', '-preset ultrafast']) // Add ultrafast preset
+            .format('rawvideo')
+            .on('error', (err) => {
+                console.error('FFmpeg error:', err);
+                isProcessing = false;
+                setTimeout(processFrame, 1000); // Retry after 1 second
+            })
+            .pipe(outputStream);
+    };
+    
+    processFrame(); // Start processing
+};
+
+// Replace the setInterval with adaptive processing
+setTimeout(startAdaptiveProcessing, 1000);
 
 // IDENTICAL endpoints
 app.get('/frame', (req, res) => {
