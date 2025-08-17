@@ -10,10 +10,9 @@ ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 ffmpeg.setFfprobePath(ffprobeInstaller.path);
 
 const app = express();
-const PORT = process.env.PORT || 10000; // Render uses port 10000
+const PORT = process.env.PORT || 10000; 
 
-// Put your video file as 'video.mp4' in the repo
-const VIDEO_PATH = path.join(__dirname, 'video.mp4');
+const VIDEO_URL = process.env.VIDEO_URL || 'https://files.catbox.moe/4ajlnv.mp4'; // i know this isnt really sophie rain but ima use to troll lil kids
 
 const FPS = 10;
 const WIDTH = 160;
@@ -24,7 +23,6 @@ let videoDuration = 0;
 let lastPixels = [];
 let isProcessing = false;
 
-// CORS for Roblox
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -32,14 +30,14 @@ app.use((req, res, next) => {
     next();
 });
 
-// Health endpoint (prevents sleeping)
 app.get('/', (req, res) => {
     res.json({
         status: '✅ Video server running',
         uptime: Math.floor(process.uptime()),
         frame: currentFrame,
         timestamp: currentFrame / FPS,
-        videoExists: fs.existsSync(VIDEO_PATH)
+        videoUrl: VIDEO_URL,
+        duration: videoDuration
     });
 });
 
@@ -52,20 +50,18 @@ app.get('/ping', (req, res) => {
     });
 });
 
-// Video duration check
+// Video duration check with URL
 const getVideoDuration = () => {
     return new Promise((resolve) => {
-        if (!fs.existsSync(VIDEO_PATH)) {
-            console.log('⚠️  Video file not found, using test mode');
-            resolve(60);
-            return;
-        }
+        console.log(`📹 Analyzing video: ${VIDEO_URL}`);
         
-        ffmpeg.ffprobe(VIDEO_PATH, (err, metadata) => {
+        ffmpeg.ffprobe(VIDEO_URL, (err, metadata) => {
             if (err) {
-                console.warn('⚠️  ffprobe failed, using fallback');
+                console.warn('⚠️  ffprobe failed, using fallback duration');
+                console.error(err.message);
                 resolve(60);
             } else {
+                console.log('✅ Video metadata loaded successfully');
                 resolve(metadata.format.duration);
             }
         });
@@ -74,18 +70,29 @@ const getVideoDuration = () => {
 
 // Initialize
 (async () => {
-    videoDuration = await getVideoDuration();
-    console.log(`📹 Duration: ${videoDuration}s`);
-    console.log(`🎬 Frames: ${Math.floor(videoDuration * FPS)}`);
-    console.log(`📺 Resolution: ${WIDTH}x${HEIGHT}`);
+    console.log('🚀 Starting video server...');
+    console.log(`📹 Video URL: ${VIDEO_URL}`);
     
-    if (fs.existsSync(VIDEO_PATH)) {
+    videoDuration = await getVideoDuration();
+    console.log(`⏱️  Duration: ${videoDuration}s`);
+    console.log(`🎬 Total frames: ${Math.floor(videoDuration * FPS)}`);
+    console.log(`📺 Resolution: ${WIDTH}x${HEIGHT} pixels`);
+    
+    if (VIDEO_URL && VIDEO_URL !== 'https://your-video-url-here.mp4') {
         startProcessing();
-        console.log('🚀 Video processing started!');
+        console.log('✅ Video processing started!');
     } else {
-        console.log('📁 Add video.mp4 to enable video streaming');
-        // Create dummy data for testing
-        lastPixels = Array(WIDTH * HEIGHT).fill([255, 0, 255]); // Purple test pattern
+        console.log('⚠️  Set VIDEO_URL environment variable to enable streaming');
+        // Create rainbow test pattern for demo
+        lastPixels = Array(WIDTH * HEIGHT).fill(0).map((_, i) => {
+            const x = i % WIDTH;
+            const y = Math.floor(i / WIDTH);
+            return [
+                Math.floor((x / WIDTH) * 255),
+                Math.floor((y / HEIGHT) * 255),
+                128
+            ];
+        });
     }
 })();
 
@@ -114,14 +121,14 @@ const startProcessing = () => {
             isProcessing = false;
         });
         
-        ffmpeg(VIDEO_PATH)
+        ffmpeg(VIDEO_URL) // Use URL instead of file path
             .seekInput(seekTime)
             .frames(1)
             .size(`${WIDTH}x${HEIGHT}`)
             .outputOptions('-pix_fmt rgb24')
             .format('rawvideo')
             .on('error', (err) => {
-                console.error('FFmpeg error:', err);
+                console.error('FFmpeg error:', err.message);
                 isProcessing = false;
             })
             .pipe(outputStream);
@@ -150,7 +157,8 @@ app.get('/info', (req, res) => {
         height: HEIGHT,
         totalFrames: Math.floor(videoDuration * FPS),
         isProcessing,
-        videoExists: fs.existsSync(VIDEO_PATH)
+        videoUrl: VIDEO_URL,
+        hasValidUrl: VIDEO_URL && VIDEO_URL !== 'https://your-video-url-here.mp4'
     });
 });
 
@@ -159,18 +167,15 @@ app.listen(PORT, () => {
     console.log(`🌐 Render will provide the public URL`);
 });
 
-// Self-ping to prevent sleeping (every 14 minutes)
 if (process.env.NODE_ENV === 'production') {
     const selfPing = () => {
         try {
-            // This will be your Render URL
             const url = process.env.RENDER_EXTERNAL_URL;
             if (url) {
                 require('https').get(`${url}/ping`);
                 console.log('🏓 Self-ping sent');
             }
         } catch (err) {
-            // Silent fail
         }
     };
     
