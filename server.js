@@ -12,7 +12,7 @@ ffmpeg.setFfprobePath(ffprobeInstaller.path);
 const app = express();
 const PORT = process.env.PORT || 10000; 
 
-const VIDEO_URL = process.env.VIDEO_URL || 'https://files.catbox.moe/4ajlnv.mp4';
+const VIDEO_URL = process.env.VIDEO_URL || 'https://drive.google.com/uc?export=download&id=1p60qpDl6wd1PbO2wt6Ft5N0tFvOo_pnf';
 
 const FPS = 6;
 const WIDTH = 192;
