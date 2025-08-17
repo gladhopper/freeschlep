@@ -5,21 +5,25 @@ const ffprobeInstaller = require('@ffprobe-installer/ffprobe');
 const fs = require('fs');
 const { PassThrough } = require('stream');
 const path = require('path');
+const https = require('https');
+const http = require('http');
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 ffmpeg.setFfprobePath(ffprobeInstaller.path);
 
 const app = express();
-const PORT = process.env.PORT || 10000; 
+const PORT = process.env.PORT || 10000;
 
-const VIDEO_URL = process.env.VIDEO_URL || 'https://pomf2.lain.la/f/cqk3wtk.mp4';
+// FIX: Add fallback video URL
+const PRIMARY_VIDEO_URL = process.env.VIDEO_URL || 'https://pomf2.lain.la/f/cqk3wtk.mp4';
+const FALLBACK_VIDEO_URL = 'https://sample-videos.com/video123/mp4/720/big_buck_bunny_720p_1mb.mp4'; // Reliable fallback
 
 const FPS = 6;
 const WIDTH = 192;
 const HEIGHT = 144;
 
 let currentFrame = 0;
-let videoDuration = 0;
+let videoDuration = 60; // FIX: Default duration if analysis fails
 let lastPixels = [];
 let isProcessing = false;
 let consecutiveErrors = 0;
@@ -38,7 +42,7 @@ app.get('/', (req, res) => {
         uptime: Math.floor(process.uptime()),
         frame: currentFrame,
         timestamp: currentFrame / FPS,
-        videoUrl: VIDEO_URL,
+        videoUrl: PRIMARY_VIDEO_URL,
         duration: videoDuration,
         errors: consecutiveErrors,
         resolution: `${WIDTH}x${HEIGHT}`,
@@ -49,8 +53,8 @@ app.get('/', (req, res) => {
 });
 
 app.get('/ping', (req, res) => {
-    res.json({ 
-        pong: true, 
+    res.json({
+        pong: true,
         time: new Date().toISOString(),
         frame: currentFrame,
         errors: consecutiveErrors,
@@ -60,7 +64,7 @@ app.get('/ping', (req, res) => {
 
 app.get('/debug', (req, res) => {
     res.json({
-        videoUrl: VIDEO_URL,
+        videoUrl: PRIMARY_VIDEO_URL,
         videoInfo: videoInfo,
         currentFrame: currentFrame,
         duration: videoDuration,
@@ -72,55 +76,55 @@ app.get('/debug', (req, res) => {
     });
 });
 
-// Enhanced video analysis with better error handling
-const analyzeVideo = () => {
-    return new Promise((resolve) => {
-        console.log(`📹 Analyzing video URL: ${VIDEO_URL}`);
-        console.log(`🔍 Testing URL accessibility...`);
-        
-        // Test if URL is accessible first
-        const https = require('https');
-        const http = require('http');
-        const client = VIDEO_URL.startsWith('https') ? https : http;
-        
-        const testRequest = client.request(VIDEO_URL.replace(/\?.*/, ''), { method: 'HEAD' }, (res) => {
-            console.log(`📡 URL Response: ${res.statusCode} ${res.statusMessage}`);
-            console.log(`📦 Content-Type: ${res.headers['content-type']}`);
-            console.log(`📏 Content-Length: ${res.headers['content-length']}`);
-            
-            if (res.statusCode === 200) {
-                console.log('✅ URL is accessible, analyzing with FFprobe...');
-                runFFprobe(resolve);
-            } else {
-                console.error('❌ URL not accessible:', res.statusCode);
-                resolve({ duration: 60, error: `HTTP ${res.statusCode}` });
-            }
-        });
-        
-        testRequest.on('error', (error) => {
-            console.error('❌ URL test failed:', error.message);
-            resolve({ duration: 60, error: error.message });
-        });
-        
-        testRequest.setTimeout(10000, () => {
-            console.error('⏰ URL test timeout');
-            testRequest.destroy();
-            resolve({ duration: 60, error: 'Timeout' });
-        });
-        
-        testRequest.end();
-    });
+// FIX: Enhanced video analysis with retries and fallback
+const analyzeVideo = async (url, retries = 3) => {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        console.log(`📹 Attempt ${attempt}: Analyzing video URL: ${url}`);
+        try {
+            const result = await new Promise((resolve) => {
+                console.log(`🔍 Testing URL accessibility...`);
+                const client = url.startsWith('https') ? https : http;
+                const testRequest = client.request(url.replace(/\?.*/, ''), { method: 'HEAD' }, (res) => {
+                    console.log(`📡 URL Response: ${res.statusCode} ${res.statusMessage}`);
+                    console.log(`📦 Content-Type: ${res.headers['content-type']}`);
+                    console.log(`📏 Content-Length: ${res.headers['content-length']}`);
+                    if (res.statusCode === 200) {
+                        console.log('✅ URL is accessible, analyzing with FFprobe...');
+                        runFFprobe(url, resolve);
+                    } else {
+                        resolve({ duration: 60, error: `HTTP ${res.statusCode}` });
+                    }
+                });
+                testRequest.on('error', (error) => {
+                    console.error('❌ URL test failed:', error.message);
+                    resolve({ duration: 60, error: error.message });
+                });
+                testRequest.setTimeout(15000, () => { // FIX: Increased timeout to 15s
+                    console.error('⏰ URL test timeout');
+                    testRequest.destroy();
+                    resolve({ duration: 60, error: 'Timeout' });
+                });
+                testRequest.end();
+            });
+            if (!result.error) return result;
+            console.log(`⚠️ Attempt ${attempt} failed: ${result.error}`);
+        } catch (error) {
+            console.error(`❌ Attempt ${attempt} error: ${error.message}`);
+        }
+        if (attempt < retries) await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+    return { duration: 60, error: 'All retries failed' };
 };
 
-const runFFprobe = (resolve) => {
+const runFFprobe = (url, resolve) => {
+    // FIX: Simplified FFprobe command to reduce crash likelihood
     const timeout = setTimeout(() => {
-        console.log('⏰ FFprobe timeout after 15 seconds');
+        console.log('⏰ FFprobe timeout after 20 seconds');
         resolve({ duration: 60, error: 'FFprobe timeout' });
-    }, 15000);
-    
-    ffmpeg.ffprobe(VIDEO_URL, {timeout: 10}, (err, metadata) => {
+    }, 20000); // FIX: Increased timeout to 20s
+
+    ffmpeg.ffprobe(url, ['-show_streams', '-show_format', '-print_format json'], (err, metadata) => {
         clearTimeout(timeout);
-        
         if (err) {
             console.error('❌ FFprobe failed:', err.message);
             resolve({ duration: 60, error: err.message });
@@ -129,7 +133,6 @@ const runFFprobe = (resolve) => {
             console.log(`   Duration: ${metadata.format.duration}s`);
             console.log(`   Format: ${metadata.format.format_name}`);
             console.log(`   Size: ${metadata.format.size} bytes`);
-            
             if (metadata.streams && metadata.streams[0]) {
                 const videoStream = metadata.streams.find(s => s.codec_type === 'video');
                 if (videoStream) {
@@ -138,9 +141,8 @@ const runFFprobe = (resolve) => {
                     console.log(`   FPS: ${videoStream.r_frame_rate}`);
                 }
             }
-            
             resolve({
-                duration: metadata.format.duration,
+                duration: metadata.format.duration || 60, // FIX: Fallback duration
                 metadata: metadata,
                 error: null
             });
@@ -162,32 +164,38 @@ const runFFprobe = (resolve) => {
         const y = Math.floor(i / WIDTH);
         return [
             Math.floor((x / WIDTH) * 255),
-            Math.floor((y / HEIGHT) * 255), 
+            Math.floor((y / HEIGHT) * 255),
             Math.floor(((x + y) / (WIDTH + HEIGHT)) * 255)
         ];
     });
     console.log(`✅ Test pattern created: ${lastPixels.length} pixels`);
     
-    // Analyze video
-    videoInfo = await analyzeVideo();
-    videoDuration = videoInfo.duration;
+    // FIX: Try primary URL, then fallback
+    videoInfo = await analyzeVideo(PRIMARY_VIDEO_URL);
+    if (videoInfo.error) {
+        console.error(`❌ Primary video analysis failed: ${videoInfo.error}`);
+        console.log(`🔄 Trying fallback URL: ${FALLBACK_VIDEO_URL}`);
+        videoInfo = await analyzeVideo(FALLBACK_VIDEO_URL);
+    }
     
+    videoDuration = videoInfo.duration;
     if (videoInfo.error) {
         console.error(`❌ Video analysis failed: ${videoInfo.error}`);
         console.log('🎨 Will use test pattern only');
     } else {
-        console.log(`⏱️  Video Duration: ${videoDuration}s`);
+        console.log(`⏱️ Video Duration: ${videoDuration}s`);
         console.log(`🎬 Total frames: ${Math.floor(videoDuration * FPS)}`);
-        
-        if (VIDEO_URL && VIDEO_URL !== 'https://your-video-url-here.mp4') {
-            startProcessing();
+        // FIX: Use the successful URL for processing
+        const activeUrl = videoInfo.metadata ? PRIMARY_VIDEO_URL : FALLBACK_VIDEO_URL;
+        if (activeUrl && activeUrl !== 'https://your-video-url-here.mp4') {
+            startProcessing(activeUrl);
             console.log('✅ Video processing started!');
         }
     }
 })();
 
 // Enhanced processing with detailed debugging
-const startProcessing = () => {
+const startProcessing = (videoUrl) => {
     let processingActive = false;
     
     const processNextFrame = async () => {
@@ -205,33 +213,27 @@ const startProcessing = () => {
         processingActive = true;
         const seekTime = currentFrame / FPS;
         
-        console.log(`🎞️  Processing frame ${currentFrame} at ${seekTime.toFixed(2)}s...`);
+        console.log(`🎞️ Processing frame ${currentFrame} at ${seekTime.toFixed(2)}s...`);
         
         try {
-            const pixels = await processFrameWithDebug(seekTime);
-            
+            const pixels = await processFrameWithDebug(videoUrl, seekTime);
             if (pixels && pixels.length > 0) {
                 lastPixels = pixels;
                 consecutiveErrors = 0;
                 console.log(`✅ Frame ${currentFrame} success: ${pixels.length} pixels`);
             } else {
-                console.warn(`⚠️  Frame ${currentFrame} returned no pixels`);
+                console.warn(`⚠️ Frame ${currentFrame} returned no pixels`);
                 consecutiveErrors++;
             }
-            
             currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
-            
         } catch (error) {
             console.error(`❌ Frame ${currentFrame} failed: ${error.message}`);
             consecutiveErrors++;
-            
-            // Skip ahead on repeated failures
             if (consecutiveErrors > 2) {
                 currentFrame = (currentFrame + FPS * 2) % Math.floor(videoDuration * FPS);
-                console.log(`⏭️  Skipping to frame ${currentFrame} due to errors`);
+                console.log(`⏭️ Skipping to frame ${currentFrame} due to errors`);
             }
         }
-        
         processingActive = false;
     };
     
@@ -239,7 +241,7 @@ const startProcessing = () => {
 };
 
 // Enhanced frame processing with detailed logging
-const processFrameWithDebug = (seekTime) => {
+const processFrameWithDebug = (videoUrl, seekTime) => {
     return new Promise((resolve, reject) => {
         let pixelBuffer = Buffer.alloc(0);
         let hasCompleted = false;
@@ -253,7 +255,7 @@ const processFrameWithDebug = (seekTime) => {
                 console.log(`⏰ Timeout processing frame at ${seekTime}s`);
                 reject(new Error('Processing timeout'));
             }
-        }, 12000); // Longer timeout for debugging
+        }, 15000); // FIX: Increased timeout to 15s
         
         outputStream.on('data', chunk => {
             if (!hasCompleted) {
@@ -277,7 +279,7 @@ const processFrameWithDebug = (seekTime) => {
             }
             
             if (pixelBuffer.length !== expectedSize) {
-                console.warn(`⚠️  Size mismatch: got ${pixelBuffer.length}, expected ${expectedSize}`);
+                console.warn(`⚠️ Size mismatch: got ${pixelBuffer.length}, expected ${expectedSize}`);
             }
             
             try {
@@ -286,15 +288,13 @@ const processFrameWithDebug = (seekTime) => {
                     if (i + 2 < pixelBuffer.length) {
                         pixels.push([
                             pixelBuffer[i],
-                            pixelBuffer[i + 1], 
+                            pixelBuffer[i + 1],
                             pixelBuffer[i + 2]
                         ]);
                     }
                 }
-                
                 console.log(`✅ Processed ${pixels.length} pixels from ${pixelBuffer.length} bytes`);
                 resolve(pixels);
-                
             } catch (error) {
                 console.error('❌ Pixel processing error:', error.message);
                 reject(error);
@@ -310,11 +310,9 @@ const processFrameWithDebug = (seekTime) => {
             }
         });
         
-        // FFmpeg command with extra debugging
         try {
             console.log(`🎬 Starting FFmpeg for frame at ${seekTime}s...`);
-            
-            const command = ffmpeg(VIDEO_URL)
+            const command = ffmpeg(videoUrl)
                 .seekInput(seekTime)
                 .frames(1)
                 .size(`${WIDTH}x${HEIGHT}`)
@@ -326,13 +324,12 @@ const processFrameWithDebug = (seekTime) => {
                     '-an',
                     '-sws_flags bilinear',
                     '-f rawvideo',
-                    '-avoid_negative_ts make_zero'  // Handle timestamp issues
+                    '-avoid_negative_ts make_zero'
                 ])
                 .on('start', (cmd) => {
                     console.log(`🎬 FFmpeg started: seeking to ${seekTime}s`);
                 })
                 .on('stderr', (stderrLine) => {
-                    // Log important FFmpeg messages
                     if (stderrLine.includes('Error') || stderrLine.includes('failed')) {
                         console.log(`FFmpeg: ${stderrLine}`);
                     }
@@ -345,9 +342,7 @@ const processFrameWithDebug = (seekTime) => {
                         reject(err);
                     }
                 });
-            
             command.pipe(outputStream);
-                
         } catch (error) {
             if (!hasCompleted) {
                 hasCompleted = true;
@@ -382,7 +377,7 @@ app.get('/info', (req, res) => {
         height: HEIGHT,
         totalFrames: Math.floor(videoDuration * FPS),
         isProcessing,
-        videoUrl: VIDEO_URL,
+        videoUrl: PRIMARY_VIDEO_URL,
         consecutiveErrors,
         pixelCount: lastPixels.length,
         expectedPixels: WIDTH * HEIGHT,
