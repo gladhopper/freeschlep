@@ -1,13 +1,34 @@
 const express = require('express');
+const ffmpeg = require('fluent-ffmpeg');
+const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
+const ffprobeInstaller = require('@ffprobe-installer/ffprobe');
+const fs = require('fs');
+const { PassThrough } = require('stream');
+const path = require('path');
+
+ffmpeg.setFfmpegPath(ffmpegInstaller.path);
+ffmpeg.setFfprobePath(ffprobeInstaller.path);
+
 const app = express();
 const PORT = process.env.PORT || 10000;
 
+const VIDEO_PATH = path.join(__dirname, 's.mp4');
+const FPS = 6;
 const WIDTH = 192;
 const HEIGHT = 144;
-const FPS = 6;
 
+// OPTIMIZATION 1: Frame cache to avoid re-processing
+const frameCache = new Map();
+const CACHE_SIZE = 100; // Cache 100 frames (~16 seconds at 6fps)
+
+// OPTIMIZATION 2: Batch processing state
 let currentFrame = 0;
-const totalFrames = 300;
+let videoDuration = 60;
+let lastPixels = [];
+let isProcessing = false;
+let consecutiveErrors = 0;
+let videoInfo = null;
+let batchProcessor = null;
 
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
@@ -16,165 +37,235 @@ app.use((req, res, next) => {
     next();
 });
 
-// OPTIMIZED: Batch frame delivery
-app.get('/frames/:count?', (req, res) => {
-    const count = Math.min(parseInt(req.params.count) || 30, 60); // Max 60 frames at once
-    const frames = [];
+const analyzeVideo = async (videoPath) => {
+    console.log(`📹 Analyzing video: ${videoPath}`);
+    if (!fs.existsSync(videoPath)) {
+        console.error(`❌ Video file not found: ${videoPath}`);
+        return { duration: 60, error: 'Video file not found' };
+    }
     
-    for (let i = 0; i < count; i++) {
-        const frameNum = (currentFrame + i) % totalFrames;
-        frames.push({
-            pixels: generateFrame(frameNum),
-            frame: frameNum,
-            timestamp: frameNum / FPS
+    return new Promise((resolve) => {
+        const timeout = setTimeout(() => {
+            resolve({ duration: 60, error: 'FFprobe timeout' });
+        }, 10000);
+
+        ffmpeg.ffprobe(videoPath, (err, metadata) => {
+            clearTimeout(timeout);
+            if (err) {
+                resolve({ duration: 60, error: err.message });
+            } else {
+                resolve({
+                    duration: metadata.format.duration || 60,
+                    metadata: metadata,
+                    error: null
+                });
+            }
+        });
+    });
+};
+
+// OPTIMIZATION 3: Batch process multiple frames at once
+class BatchFrameProcessor {
+    constructor(videoPath, fps, width, height) {
+        this.videoPath = videoPath;
+        this.fps = fps;
+        this.width = width;
+        this.height = height;
+        this.isProcessing = false;
+        this.queue = [];
+    }
+
+    async processFrameBatch(startFrame, count = 10) {
+        if (this.isProcessing) return;
+        this.isProcessing = true;
+
+        console.log(`🎬 Batch processing ${count} frames starting from ${startFrame}`);
+
+        try {
+            const startTime = startFrame / this.fps;
+            const frames = await this.extractFrames(startTime, count);
+            
+            // Cache all the frames
+            frames.forEach((pixels, index) => {
+                const frameNum = startFrame + index;
+                frameCache.set(frameNum, pixels);
+                
+                // Keep cache size manageable
+                if (frameCache.size > CACHE_SIZE) {
+                    const oldestKey = frameCache.keys().next().value;
+                    frameCache.delete(oldestKey);
+                }
+            });
+
+            console.log(`✅ Cached ${frames.length} frames (cache size: ${frameCache.size})`);
+        } catch (error) {
+            console.error(`❌ Batch processing failed: ${error.message}`);
+        }
+
+        this.isProcessing = false;
+    }
+
+    extractFrames(startTime, count) {
+        return new Promise((resolve, reject) => {
+            let frameData = [];
+            let currentFrameBuffer = Buffer.alloc(0);
+            const expectedFrameSize = this.width * this.height * 3;
+            let framesReceived = 0;
+
+            const outputStream = new PassThrough();
+
+            const timeout = setTimeout(() => {
+                reject(new Error('Batch processing timeout'));
+            }, 30000);
+
+            outputStream.on('data', chunk => {
+                currentFrameBuffer = Buffer.concat([currentFrameBuffer, chunk]);
+                
+                // Check if we have complete frames
+                while (currentFrameBuffer.length >= expectedFrameSize) {
+                    const frameBuffer = currentFrameBuffer.slice(0, expectedFrameSize);
+                    currentFrameBuffer = currentFrameBuffer.slice(expectedFrameSize);
+                    
+                    // Convert frame buffer to pixels
+                    const pixels = [];
+                    for (let i = 0; i < frameBuffer.length; i += 3) {
+                        pixels.push([frameBuffer[i], frameBuffer[i + 1], frameBuffer[i + 2]]);
+                    }
+                    
+                    frameData.push(pixels);
+                    framesReceived++;
+                    
+                    if (framesReceived >= count) {
+                        clearTimeout(timeout);
+                        resolve(frameData);
+                        return;
+                    }
+                }
+            });
+
+            outputStream.on('end', () => {
+                clearTimeout(timeout);
+                resolve(frameData);
+            });
+
+            outputStream.on('error', (error) => {
+                clearTimeout(timeout);
+                reject(error);
+            });
+
+            // OPTIMIZATION 4: More efficient FFmpeg command
+            const command = ffmpeg(this.videoPath)
+                .seekInput(startTime)
+                .frames(count)
+                .size(`${this.width}x${this.height}`)
+                .outputOptions([
+                    '-pix_fmt rgb24',
+                    '-f rawvideo',
+                    '-threads 2',
+                    '-preset ultrafast',
+                    '-an',
+                    '-sws_flags fast_bilinear'
+                ])
+                .on('error', reject);
+                
+            command.pipe(outputStream);
         });
     }
-    
-    res.json({
-        frames: frames,
-        startFrame: currentFrame,
-        width: WIDTH,
-        height: HEIGHT,
-        fps: FPS,
-        batchSize: count
-    });
-});
+}
 
-// OPTIMIZED: Pre-compressed frame data
-app.get('/frame-stream', (req, res) => {
-    res.writeHead(200, {
-        'Content-Type': 'text/plain',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
-    });
-    
-    // Send 10 frames immediately
-    for (let i = 0; i < 10; i++) {
-        const frameNum = (currentFrame + i) % totalFrames;
-        const pixels = generateFrame(frameNum);
-        res.write(`data: ${JSON.stringify({
-            pixels: pixels,
-            frame: frameNum,
-            timestamp: frameNum / FPS
-        })}\n\n`);
-    }
-    
-    res.end();
-});
+// OPTIMIZATION 5: Predictive caching
+const startPredictiveCaching = () => {
+    setInterval(async () => {
+        if (!batchProcessor || batchProcessor.isProcessing) return;
+        
+        // Cache frames ahead of current position
+        const lookahead = 20; // Cache 20 frames ahead
+        const targetFrame = (currentFrame + lookahead) % Math.floor(videoDuration * FPS);
+        
+        // Only process if we don't have this frame cached
+        if (!frameCache.has(targetFrame)) {
+            await batchProcessor.processFrameBatch(targetFrame, 10);
+        }
+    }, 2000); // Check every 2 seconds
+};
 
-// Keep original single frame endpoint for compatibility
+const startProcessing = (videoPath) => {
+    batchProcessor = new BatchFrameProcessor(videoPath, FPS, WIDTH, HEIGHT);
+    
+    // Process initial batch
+    batchProcessor.processFrameBatch(0, 30);
+    
+    // Start predictive caching
+    startPredictiveCaching();
+
+    // Frame advancement (much faster now with cache)
+    setInterval(() => {
+        // Check if we have the current frame cached
+        if (frameCache.has(currentFrame)) {
+            lastPixels = frameCache.get(currentFrame);
+            consecutiveErrors = 0;
+        } else {
+            console.log(`⚠️ Cache miss for frame ${currentFrame}`);
+            consecutiveErrors++;
+            
+            // Trigger immediate batch processing for missing frames
+            if (!batchProcessor.isProcessing) {
+                batchProcessor.processFrameBatch(currentFrame, 10);
+            }
+        }
+        
+        currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
+    }, 1000 / FPS);
+};
+
+// API Endpoints
 app.get('/frame', (req, res) => {
-    const pixels = generateFrame(currentFrame);
-    
     res.json({
-        pixels: pixels,
+        pixels: lastPixels,
         frame: currentFrame,
         timestamp: currentFrame / FPS,
         width: WIDTH,
         height: HEIGHT,
-        status: 'ready'
+        cached: frameCache.has(currentFrame),
+        cacheSize: frameCache.size,
+        errors: consecutiveErrors
     });
 });
-
-// MUCH FASTER: Return multiple frames as base64 encoded data
-app.get('/frames-compact/:count?', (req, res) => {
-    const count = Math.min(parseInt(req.params.count) || 20, 40);
-    const frames = [];
-    
-    for (let i = 0; i < count; i++) {
-        const frameNum = (currentFrame + i) % totalFrames;
-        const pixels = generateFrame(frameNum);
-        
-        // Convert to compact format - just the pixel data as flat array
-        const flatPixels = pixels.flat();
-        frames.push(flatPixels);
-    }
-    
-    res.json({
-        frames: frames,
-        startFrame: currentFrame,
-        width: WIDTH,
-        height: HEIGHT,
-        fps: FPS,
-        format: 'flat_rgb'
-    });
-});
-
-const generateFrame = (frameNum) => {
-    const pixels = [];
-    const time = frameNum / FPS;
-    
-    for (let y = 0; y < HEIGHT; y++) {
-        for (let x = 0; x < WIDTH; x++) {
-            const centerX = WIDTH / 2;
-            const centerY = HEIGHT / 2;
-            const distance = Math.sqrt((x - centerX) ** 2 + (y - centerY) ** 2);
-            
-            const ripple = Math.sin(distance * 0.1 - time * 3) * 127 + 128;
-            const hue = (distance * 2 + time * 50) % 360;
-            const rgb = hslToRgb(hue / 360, 0.8, 0.6);
-            
-            pixels.push([
-                Math.floor(rgb[0] * ripple / 255),
-                Math.floor(rgb[1] * ripple / 255),
-                Math.floor(rgb[2] * ripple / 255)
-            ]);
-        }
-    }
-    
-    return pixels;
-};
-
-const hslToRgb = (h, s, l) => {
-    let r, g, b;
-
-    if (s === 0) {
-        r = g = b = l;
-    } else {
-        const hue2rgb = (p, q, t) => {
-            if (t < 0) t += 1;
-            if (t > 1) t -= 1;
-            if (t < 1/6) return p + (q - p) * 6 * t;
-            if (t < 1/2) return q;
-            if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
-            return p;
-        };
-
-        const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
-        const p = 2 * l - q;
-        r = hue2rgb(p, q, h + 1/3);
-        g = hue2rgb(p, q, h);
-        b = hue2rgb(p, q, h - 1/3);
-    }
-
-    return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
-};
 
 app.get('/info', (req, res) => {
     res.json({
-        currentFrame: currentFrame,
+        currentFrame,
         timestamp: currentFrame / FPS,
-        duration: totalFrames / FPS,
+        duration: videoDuration,
         fps: FPS,
         width: WIDTH,
         height: HEIGHT,
-        totalFrames: totalFrames,
-        status: 'Optimized pattern generator',
-        memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
-        endpoints: {
-            '/frame': 'Single frame (legacy)',
-            '/frames/30': 'Batch of 30 frames',
-            '/frames-compact/20': 'Compact batch of 20 frames',
-            '/frame-stream': 'Stream 10 frames'
-        }
+        totalFrames: Math.floor(videoDuration * FPS),
+        cacheSize: frameCache.size,
+        cacheHitRate: frameCache.has(currentFrame) ? '100%' : '0%',
+        isProcessing: batchProcessor?.isProcessing || false,
+        consecutiveErrors,
+        memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
+    });
+});
+
+app.get('/cache-status', (req, res) => {
+    const cachedFrames = Array.from(frameCache.keys()).sort((a, b) => a - b);
+    res.json({
+        cacheSize: frameCache.size,
+        cachedFrames: cachedFrames.slice(0, 20), // Show first 20
+        currentFrame,
+        nextCached: cachedFrames.find(f => f > currentFrame),
+        isProcessing: batchProcessor?.isProcessing || false
     });
 });
 
 app.get('/ping', (req, res) => {
-    res.json({ 
-        pong: true, 
-        ready: true,
-        frame: currentFrame 
+    res.json({
+        pong: true,
+        frame: currentFrame,
+        cached: frameCache.has(currentFrame),
+        cacheSize: frameCache.size
     });
 });
 
@@ -185,22 +276,43 @@ app.get('/', (req, res) => {
         frame: currentFrame,
         resolution: `${WIDTH}x${HEIGHT}`,
         fps: FPS,
-        type: 'Batch-optimized patterns',
-        memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
-        tip: 'Use /frames/30 for better performance!'
+        cacheSize: frameCache.size,
+        optimization: 'Batch processing + Frame cache',
+        memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
     });
 });
 
-// Keep the frame cycling
-setInterval(() => {
-    currentFrame = (currentFrame + 1) % totalFrames;
-}, 1000 / FPS);
+// Initialize
+(async () => {
+    console.log('🚀 Starting OPTIMIZED video server...');
+    
+    // Create test pattern as fallback
+    lastPixels = Array(WIDTH * HEIGHT).fill(0).map((_, i) => {
+        const x = i % WIDTH;
+        const y = Math.floor(i / WIDTH);
+        return [
+            Math.floor((x / WIDTH) * 255),
+            Math.floor((y / HEIGHT) * 255),
+            Math.floor(((x + y) / (WIDTH + HEIGHT)) * 255)
+        ];
+    });
+
+    videoInfo = await analyzeVideo(VIDEO_PATH);
+    videoDuration = videoInfo.duration;
+    
+    if (videoInfo.error) {
+        console.error(`❌ Video error: ${videoInfo.error}`);
+        console.log('🎨 Using test pattern only');
+    } else {
+        console.log(`✅ Video loaded: ${videoDuration}s`);
+        startProcessing(VIDEO_PATH);
+    }
+})();
 
 app.listen(PORT, () => {
-    console.log(`🚀 OPTIMIZED Video Server running on port ${PORT}`);
-    console.log(`📺 Resolution: ${WIDTH}x${HEIGHT} @ ${FPS}fps`);
-    console.log(`⚡ New endpoints: /frames/30, /frames-compact/20`);
-    console.log(`🎨 Batch delivery for smooth playback!`);
+    console.log(`🚀 OPTIMIZED Video Server on port ${PORT}`);
+    console.log(`📺 ${WIDTH}x${HEIGHT} @ ${FPS}fps`);
+    console.log(`⚡ Optimizations: Frame cache + Batch processing`);
 });
 
 if (process.env.NODE_ENV === 'production') {
