@@ -1,30 +1,25 @@
 const express = require('express');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
-const ffprobeInstaller = require('@ffprobe-installer/ffprobe');
 const fs = require('fs');
-const { PassThrough } = require('stream');
 const path = require('path');
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
-ffmpeg.setFfprobePath(ffprobeInstaller.path);
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-
-// Use local s.mp4 in the same directory as server.js
 const VIDEO_PATH = path.join(__dirname, 's.mp4');
 
 const FPS = 6;
 const WIDTH = 192;
 const HEIGHT = 144;
 
-let currentFrame = 0;
+// PRE-PROCESSED FRAMES - Much faster!
+let preProcessedFrames = [];
+let currentFrameIndex = 0;
 let videoDuration = 60;
-let lastPixels = [];
-let isProcessing = false;
-let consecutiveErrors = 0;
-let videoInfo = null;
+let isPreProcessing = false;
+let totalFrames = 0;
 
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
@@ -33,218 +28,163 @@ app.use((req, res, next) => {
     next();
 });
 
-app.get('/', (req, res) => {
+// FAST frame serving - no processing during requests!
+app.get('/frame', (req, res) => {
+    if (preProcessedFrames.length === 0) {
+        // Return test pattern if no frames ready
+        const testPixels = Array(WIDTH * HEIGHT).fill(0).map((_, i) => {
+            const x = i % WIDTH;
+            const y = Math.floor(i / WIDTH);
+            return [
+                Math.floor((x / WIDTH) * 255),
+                Math.floor((y / HEIGHT) * 128),
+                Math.floor(((x + y) / (WIDTH + HEIGHT)) * 255)
+            ];
+        });
+        return res.json({
+            pixels: testPixels,
+            frame: 0,
+            timestamp: 0,
+            status: 'preprocessing'
+        });
+    }
+
+    const frame = preProcessedFrames[currentFrameIndex];
     res.json({
-        status: '✅ Video server running (Debug Mode)',
-        uptime: Math.floor(process.uptime()),
-        frame: currentFrame,
-        timestamp: currentFrame / FPS,
-        videoPath: VIDEO_PATH,
+        pixels: frame,
+        frame: currentFrameIndex,
+        timestamp: currentFrameIndex / FPS,
+        width: WIDTH,
+        height: HEIGHT,
+        totalFrames: preProcessedFrames.length,
+        status: 'ready'
+    });
+});
+
+app.get('/info', (req, res) => {
+    res.json({
+        currentFrame: currentFrameIndex,
+        timestamp: currentFrameIndex / FPS,
         duration: videoDuration,
-        errors: consecutiveErrors,
-        resolution: `${WIDTH}x${HEIGHT}`,
-        memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
-        videoInfo: videoInfo ? 'Loaded' : 'Failed',
-        pixelsCount: lastPixels.length
+        fps: FPS,
+        width: WIDTH,
+        height: HEIGHT,
+        totalFrames: preProcessedFrames.length,
+        isPreProcessing: isPreProcessing,
+        progress: preProcessedFrames.length + '/' + totalFrames,
+        memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
     });
 });
 
 app.get('/ping', (req, res) => {
-    res.json({
-        pong: true,
-        time: new Date().toISOString(),
-        frame: currentFrame,
-        errors: consecutiveErrors,
-        hasPixels: lastPixels.length > 0
+    res.json({ 
+        pong: true, 
+        ready: preProcessedFrames.length > 0,
+        frames: preProcessedFrames.length 
     });
 });
 
-app.get('/debug', (req, res) => {
-    res.json({
-        videoPath: VIDEO_PATH,
-        videoInfo: videoInfo,
-        currentFrame: currentFrame,
-        duration: videoDuration,
-        consecutiveErrors: consecutiveErrors,
-        isProcessing: isProcessing,
-        pixelDataLength: lastPixels.length,
-        expectedPixels: WIDTH * HEIGHT,
-        memoryUsage: process.memoryUsage()
-    });
-});
-
-const analyzeVideo = async (videoPath) => {
-    console.log(`📹 Analyzing video: ${videoPath}`);
-    if (!fs.existsSync(videoPath)) {
-        console.error(`❌ Video file not found: ${videoPath}`);
-        return { duration: 60, error: 'Video file not found' };
+// PRE-PROCESS ALL FRAMES ON STARTUP
+const preProcessVideo = async () => {
+    if (isPreProcessing || !fs.existsSync(VIDEO_PATH)) {
+        console.log('❌ Video file not found or already processing');
+        return;
     }
+
+    console.log('🚀 PRE-PROCESSING video for maximum speed...');
+    isPreProcessing = true;
+
     try {
-        const result = await new Promise((resolve) => {
-            console.log('✅ File exists, analyzing with FFprobe...');
-            runFFprobe(videoPath, resolve);
+        // Get video duration
+        const metadata = await new Promise((resolve, reject) => {
+            ffmpeg.ffprobe(VIDEO_PATH, (err, data) => {
+                if (err) reject(err);
+                else resolve(data);
+            });
         });
-        return result;
+
+        videoDuration = metadata.format.duration;
+        totalFrames = Math.floor(videoDuration * FPS);
+        console.log(`📺 Video: ${videoDuration}s, ${totalFrames} frames to process`);
+
+        // PRE-PROCESS ALL FRAMES IN BATCHES
+        const batchSize = 30; // Process 30 frames at once
+        for (let batch = 0; batch < Math.ceil(totalFrames / batchSize); batch++) {
+            const startFrame = batch * batchSize;
+            const endFrame = Math.min((batch + 1) * batchSize, totalFrames);
+            
+            console.log(`🎬 Processing batch ${batch + 1}: frames ${startFrame}-${endFrame}`);
+            
+            await processBatch(startFrame, endFrame);
+            
+            console.log(`✅ Batch ${batch + 1} complete! (${preProcessedFrames.length}/${totalFrames})`);
+        }
+
+        console.log(`🎉 PRE-PROCESSING COMPLETE! ${preProcessedFrames.length} frames ready`);
+        console.log(`💾 Memory usage: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`);
+        
     } catch (error) {
-        console.error(`❌ Analysis error: ${error.message}`);
-        return { duration: 60, error: error.message };
+        console.error('❌ Pre-processing failed:', error.message);
     }
+    
+    isPreProcessing = false;
 };
 
-const runFFprobe = (videoPath, resolve) => {
-    const timeout = setTimeout(() => {
-        console.log('⏰ FFprobe timeout after 20 seconds');
-        resolve({ duration: 60, error: 'FFprobe timeout' });
-    }, 20000);
-
-    ffmpeg.ffprobe(videoPath, ['-v', 'error', '-show_streams', '-show_format', '-print_format', 'json'], (err, metadata) => {
-        clearTimeout(timeout);
-        if (err) {
-            console.error('❌ FFprobe failed:', err.message);
-            console.error('FFprobe error details:', JSON.stringify(err, null, 2));
-            resolve({ duration: 60, error: err.message });
-        } else {
-            console.log('✅ Video analysis complete!');
-            console.log(`   Duration: ${metadata.format.duration}s`);
-            console.log(`   Format: ${metadata.format.format_name}`);
-            console.log(`   Size: ${metadata.format.size} bytes`);
-            if (metadata.streams && metadata.streams[0]) {
-                const videoStream = metadata.streams.find(s => s.codec_type === 'video');
-                if (videoStream) {
-                    console.log(`   Video: ${videoStream.width}x${videoStream.height}`);
-                    console.log(`   Codec: ${videoStream.codec_name}`);
-                    console.log(`   FPS: ${videoStream.r_frame_rate}`);
+// BATCH PROCESSING - Much faster!
+const processBatch = async (startFrame, endFrame) => {
+    const promises = [];
+    
+    for (let frameNum = startFrame; frameNum < endFrame; frameNum++) {
+        const seekTime = frameNum / FPS;
+        promises.push(processFrame(seekTime, frameNum));
+        
+        // Don't overwhelm the system
+        if (promises.length >= 5) {
+            const results = await Promise.allSettled(promises.splice(0, 5));
+            results.forEach((result, i) => {
+                if (result.status === 'fulfilled' && result.value) {
+                    preProcessedFrames[startFrame + i] = result.value;
                 }
-            }
-            resolve({
-                duration: metadata.format.duration || 60,
-                metadata: metadata,
-                error: null
             });
         }
-    });
-};
-
-(async () => {
-    console.log('🚀 Starting DEBUG video server...');
-    console.log(`📺 Target Resolution: ${WIDTH}x${HEIGHT} (${WIDTH * HEIGHT} pixels)`);
-    console.log(`⚡ Target FPS: ${FPS}`);
-    console.log(`📊 Expected buffer size: ${WIDTH * HEIGHT * 3} bytes`);
-
-    console.log('🎨 Creating test pattern...');
-    lastPixels = Array(WIDTH * HEIGHT).fill(0).map((_, i) => {
-        const x = i % WIDTH;
-        const y = Math.floor(i / WIDTH);
-        return [
-            Math.floor((x / WIDTH) * 255),
-            Math.floor((y / HEIGHT) * 255),
-            Math.floor(((x + y) / (WIDTH + HEIGHT)) * 255)
-        ];
-    });
-    console.log(`✅ Test pattern created: ${lastPixels.length} pixels`);
-
-    videoInfo = await analyzeVideo(VIDEO_PATH);
-    videoDuration = videoInfo.duration;
-    if (videoInfo.error) {
-        console.error(`❌ Video analysis failed: ${videoInfo.error}`);
-        console.log('🎨 Will use test pattern only');
-    } else {
-        console.log(`⏱️ Video Duration: ${videoDuration}s`);
-        console.log(`🎬 Total frames: ${Math.floor(videoDuration * FPS)}`);
-        startProcessing(VIDEO_PATH);
-        console.log('✅ Video processing started!');
     }
-})();
-
-const startProcessing = (videoPath) => {
-    let processingActive = false;
-
-    const processNextFrame = async () => {
-        if (processingActive || consecutiveErrors > 5) {
-            if (consecutiveErrors > 5) {
-                console.log('🛑 Too many consecutive errors, pausing...');
-                setTimeout(() => {
-                    consecutiveErrors = 0;
-                    console.log('🔄 Resetting error count, resuming...');
-                }, 10000);
-            }
-            return;
-        }
-
-        processingActive = true;
-        const seekTime = currentFrame / FPS;
-
-        console.log(`🎞️ Processing frame ${currentFrame} at ${seekTime.toFixed(2)}s...`);
-
-        try {
-            const pixels = await processFrameWithDebug(videoPath, seekTime);
-            if (pixels && pixels.length > 0) {
-                lastPixels = pixels;
-                consecutiveErrors = 0;
-                console.log(`✅ Frame ${currentFrame} success: ${pixels.length} pixels`);
-            } else {
-                console.warn(`⚠️ Frame ${currentFrame} returned no pixels`);
-                consecutiveErrors++;
-            }
-            currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
-        } catch (error) {
-            console.error(`❌ Frame ${currentFrame} failed: ${error.message}`);
-            consecutiveErrors++;
-            if (consecutiveErrors > 2) {
-                currentFrame = (currentFrame + FPS * 2) % Math.floor(videoDuration * FPS);
-                console.log(`⏭️ Skipping to frame ${currentFrame} due to errors`);
-            }
-        }
-        processingActive = false;
-    };
-
-    setInterval(processNextFrame, 167);
-};
-
-const processFrameWithDebug = (videoPath, seekTime) => {
-    return new Promise((resolve, reject) => {
-        let pixelBuffer = Buffer.alloc(0);
-        let hasCompleted = false;
-        let bytesReceived = 0;
-
-        const outputStream = new PassThrough();
-
-        const timeout = setTimeout(() => {
-            if (!hasCompleted) {
-                hasCompleted = true;
-                console.log(`⏰ Timeout processing frame at ${seekTime}s`);
-                reject(new Error('Processing timeout'));
-            }
-        }, 15000);
-
-        outputStream.on('data', chunk => {
-            if (!hasCompleted) {
-                pixelBuffer = Buffer.concat([pixelBuffer, chunk]);
-                bytesReceived += chunk.length;
+    
+    // Process remaining frames
+    if (promises.length > 0) {
+        const results = await Promise.allSettled(promises);
+        results.forEach((result, i) => {
+            if (result.status === 'fulfilled' && result.value) {
+                preProcessedFrames[startFrame + promises.length - results.length + i] = result.value;
             }
         });
+    }
+};
 
-        outputStream.on('end', () => {
-            if (hasCompleted) return;
-            hasCompleted = true;
-            clearTimeout(timeout);
-
-            const expectedSize = WIDTH * HEIGHT * 3;
-            console.log(`📊 Buffer info: received ${pixelBuffer.length} bytes, expected ${expectedSize}`);
-
-            if (pixelBuffer.length === 0) {
-                console.error('❌ Empty buffer - FFmpeg produced no output');
-                reject(new Error('Empty buffer from FFmpeg'));
-                return;
-            }
-
-            if (pixelBuffer.length !== expectedSize) {
-                console.warn(`⚠️ Size mismatch: got ${pixelBuffer.length}, expected ${expectedSize}`);
-            }
-
-            try {
+// SIMPLIFIED frame processing
+const processFrame = (seekTime, frameNum) => {
+    return new Promise((resolve, reject) => {
+        let pixelBuffer = Buffer.alloc(0);
+        
+        const timeout = setTimeout(() => {
+            reject(new Error(`Frame ${frameNum} timeout`));
+        }, 5000); // Much shorter timeout
+        
+        const command = ffmpeg(VIDEO_PATH)
+            .seekInput(seekTime)
+            .frames(1)
+            .size(`${WIDTH}x${HEIGHT}`)
+            .outputOptions([
+                '-pix_fmt rgb24',
+                '-f rawvideo',
+                '-preset ultrafast',
+                '-threads 1'
+            ])
+            .on('end', () => {
+                clearTimeout(timeout);
+                
+                // Convert buffer to pixel array
                 const pixels = [];
-                for (let i = 0; i < pixelBuffer.length && i < expectedSize; i += 3) {
+                for (let i = 0; i < pixelBuffer.length; i += 3) {
                     if (i + 2 < pixelBuffer.length) {
                         pixels.push([
                             pixelBuffer[i],
@@ -253,107 +193,39 @@ const processFrameWithDebug = (videoPath, seekTime) => {
                         ]);
                     }
                 }
-                console.log(`✅ Processed ${pixels.length} pixels from ${pixelBuffer.length} bytes`);
-                resolve(pixels);
-            } catch (error) {
-                console.error('❌ Pixel processing error:', error.message);
-                reject(error);
-            }
-        });
-
-        outputStream.on('error', (error) => {
-            if (!hasCompleted) {
-                hasCompleted = true;
+                
+                resolve(pixels.length === WIDTH * HEIGHT ? pixels : null);
+            })
+            .on('error', (err) => {
                 clearTimeout(timeout);
-                console.error('❌ Output stream error:', error.message);
-                reject(error);
-            }
-        });
+                reject(err);
+            });
 
-        try {
-            console.log(`🎬 Starting FFmpeg for frame at ${seekTime}s...`);
-            const command = ffmpeg(videoPath)
-                .seekInput(seekTime)
-                .frames(1)
-                .size(`${WIDTH}x${HEIGHT}`)
-                .outputOptions([
-                    '-pix_fmt rgb24',
-                    '-threads 1',
-                    '-preset ultrafast',
-                    '-tune zerolatency',
-                    '-an',
-                    '-sws_flags bilinear',
-                    '-f rawvideo',
-                    '-avoid_negative_ts make_zero'
-                ])
-                .on('start', (cmd) => {
-                    console.log(`🎬 FFmpeg started: seeking to ${seekTime}s`);
-                })
-                .on('stderr', (stderrLine) => {
-                    if (stderrLine.includes('Error') || stderrLine.includes('failed')) {
-                        console.log(`FFmpeg: ${stderrLine}`);
-                    }
-                })
-                .on('error', (err) => {
-                    if (!hasCompleted) {
-                        hasCompleted = true;
-                        clearTimeout(timeout);
-                        console.error('❌ FFmpeg error:', err.message);
-                        reject(err);
-                    }
-                });
-            command.pipe(outputStream);
-        } catch (error) {
-            if (!hasCompleted) {
-                hasCompleted = true;
-                clearTimeout(timeout);
-                console.error('❌ FFmpeg setup error:', error.message);
-                reject(error);
-            }
-        }
+        // Collect all data
+        command.pipe().on('data', chunk => {
+            pixelBuffer = Buffer.concat([pixelBuffer, chunk]);
+        });
     });
 };
 
-app.get('/frame', (req, res) => {
-    res.json({
-        pixels: lastPixels,
-        frame: currentFrame,
-        timestamp: currentFrame / FPS,
-        width: WIDTH,
-        height: HEIGHT,
-        errors: consecutiveErrors
-    });
-});
+// FRAME CYCLING - Smooth 6fps playback
+setInterval(() => {
+    if (preProcessedFrames.length > 0) {
+        currentFrameIndex = (currentFrameIndex + 1) % preProcessedFrames.length;
+    }
+}, 1000 / FPS); // Exactly 6fps
 
-app.get('/info', (req, res) => {
-    const memory = process.memoryUsage();
-    res.json({
-        currentFrame,
-        timestamp: currentFrame / FPS,
-        duration: videoDuration,
-        fps: FPS,
-        width: WIDTH,
-        height: HEIGHT,
-        totalFrames: Math.floor(videoDuration * FPS),
-        isProcessing,
-        videoPath: VIDEO_PATH,
-        consecutiveErrors,
-        pixelCount: lastPixels.length,
-        expectedPixels: WIDTH * HEIGHT,
-        videoInfo: videoInfo,
-        memoryUsage: {
-            heapUsed: Math.round(memory.heapUsed / 1024 / 1024),
-            heapTotal: Math.round(memory.heapTotal / 1024 / 1024)
-        }
-    });
-});
-
+// START THE SERVER
 app.listen(PORT, () => {
-    console.log(`🚀 DEBUG Video Server running on port ${PORT}`);
+    console.log(`🚀 FAST Video Server running on port ${PORT}`);
     console.log(`📺 Resolution: ${WIDTH}x${HEIGHT} @ ${FPS}fps`);
-    console.log(`🔧 Debug endpoints: /debug, /info, /ping`);
+    console.log(`⚡ Pre-processing mode: ALL frames processed at startup`);
+    
+    // Start pre-processing
+    setTimeout(preProcessVideo, 1000);
 });
 
+// Keep-alive for Render
 if (process.env.NODE_ENV === 'production') {
     setInterval(() => {
         try {
