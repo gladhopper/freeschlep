@@ -74,14 +74,23 @@ const getVideoDuration = () => {
     }
 })();
 
-// Simplified, fast processing like your working version
+// Simplified, fast processing with timing debug
 const startProcessing = () => {
-    setInterval(() => {
-        if (isProcessing || !videoDuration) return;
+    let frameStartTime;
+    let consecutiveErrors = 0;
+    
+    const processFrame = () => {
+        if (isProcessing || !videoDuration) {
+            console.log(`⏸️ Skipping frame - isProcessing: ${isProcessing}, videoDuration: ${videoDuration}`);
+            return;
+        }
         
+        frameStartTime = Date.now();
         isProcessing = true;
         const seekTime = currentFrame / FPS;
         let pixelBuffer = Buffer.alloc(0);
+        
+        console.log(`🎬 Starting frame ${currentFrame} at ${seekTime.toFixed(2)}s`);
         
         const outputStream = new PassThrough();
         
@@ -99,21 +108,35 @@ const startProcessing = () => {
                 }
                 lastPixels = pixels;
                 currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
+                consecutiveErrors = 0;
                 
-                // Log every 5 seconds
-                if (currentFrame % (FPS * 5) === 0) {
-                    console.log(`✅ Frame ${currentFrame} (${seekTime.toFixed(2)}s) - ${pixels.length} pixels`);
-                }
+                const processingTime = Date.now() - frameStartTime;
+                console.log(`✅ Frame ${currentFrame-1} complete in ${processingTime}ms - ${pixels.length} pixels`);
+                
             } catch (error) {
                 console.error('Pixel processing error:', error.message);
+                consecutiveErrors++;
             }
             isProcessing = false;
         });
         
         outputStream.on('error', (err) => {
             console.error('Stream error:', err.message);
+            consecutiveErrors++;
+            if (consecutiveErrors > 3) {
+                console.log('🛑 Too many errors, skipping ahead...');
+                currentFrame = (currentFrame + 5) % Math.floor(videoDuration * FPS);
+                consecutiveErrors = 0;
+            }
             isProcessing = false;
         });
+        
+        // Add timeout to prevent hanging
+        const timeout = setTimeout(() => {
+            console.log(`⏰ Frame ${currentFrame} timeout after 2 seconds`);
+            isProcessing = false;
+            consecutiveErrors++;
+        }, 2000);
         
         // SIMPLIFIED FFMPEG - like your working version
         ffmpeg(VIDEO_PATH)
@@ -124,11 +147,19 @@ const startProcessing = () => {
             .format('rawvideo')
             .on('error', (err) => {
                 console.error('FFmpeg error:', err.message);
+                clearTimeout(timeout);
+                consecutiveErrors++;
                 isProcessing = false;
             })
+            .on('end', () => {
+                clearTimeout(timeout);
+            })
             .pipe(outputStream);
-            
-    }, 1000 / FPS); // Match your working version timing
+    };
+    
+    // Start with immediate processing, then set interval
+    processFrame();
+    setInterval(processFrame, 1000 / FPS);
 };
 
 // Status endpoints
