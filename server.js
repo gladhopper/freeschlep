@@ -14,16 +14,17 @@ ffmpeg.setFfprobePath(ffprobeInstaller.path);
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// FIX: Add fallback video URL
-const PRIMARY_VIDEO_URL = process.env.VIDEO_URL || 'https://pomf2.lain.la/f/cqk3wtk.mp4';
-const FALLBACK_VIDEO_URL = 'https://sample-videos.com/video123/mp4/720/big_buck_bunny_720p_1mb.mp4'; // Reliable fallback
+// Updated: Use MediaFire direct link as primary URL
+const PRIMARY_VIDEO_URL = process.env.VIDEO_URL || 'https://download1530.mediafire.com/3o4juukzcliguYLFJnsadxcJ87DmfrqqK9UVDNhEcz3uYEMSKiqd_2OFp4OLRxXgZtuE7rTBBS0KRDj8nAEtDGGl0nKRM9NGX7oD_txjx0tlINo3JziusbhsaLp7JGOhgZNr4ftm8wQIKFrkZnlYZBzzTRnwDfLWf3vdLDYI56g/y9v8mehyrwd9y4n/h.mp4';
+const FALLBACK_VIDEO_URL = 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4'; // Reliable fallback
+const LOCAL_FALLBACK_PATH = path.join(__dirname, 'fallback.mp4'); // Local file fallback
 
 const FPS = 6;
 const WIDTH = 192;
 const HEIGHT = 144;
 
 let currentFrame = 0;
-let videoDuration = 60; // FIX: Default duration if analysis fails
+let videoDuration = 60; // Default duration if analysis fails
 let lastPixels = [];
 let isProcessing = false;
 let consecutiveErrors = 0;
@@ -76,8 +77,8 @@ app.get('/debug', (req, res) => {
     });
 });
 
-// FIX: Enhanced video analysis with retries and fallback
-const analyzeVideo = async (url, retries = 3) => {
+// Enhanced video analysis with retries and fallback
+const analyzeVideo = async (url, retries = 3, isPrimary = true) => {
     for (let attempt = 1; attempt <= retries; attempt++) {
         console.log(`📹 Attempt ${attempt}: Analyzing video URL: ${url}`);
         try {
@@ -86,20 +87,21 @@ const analyzeVideo = async (url, retries = 3) => {
                 const client = url.startsWith('https') ? https : http;
                 const testRequest = client.request(url.replace(/\?.*/, ''), { method: 'HEAD' }, (res) => {
                     console.log(`📡 URL Response: ${res.statusCode} ${res.statusMessage}`);
-                    console.log(`📦 Content-Type: ${res.headers['content-type']}`);
-                    console.log(`📏 Content-Length: ${res.headers['content-length']}`);
-                    if (res.statusCode === 200) {
+                    console.log(`📦 Content-Type: ${res.headers['content-type'] || 'undefined'}`);
+                    console.log(`📏 Content-Length: ${res.headers['content-length'] || 'undefined'}`);
+                    if (res.statusCode === 200 && res.headers['content-type']?.includes('video/')) {
                         console.log('✅ URL is accessible, analyzing with FFprobe...');
                         runFFprobe(url, resolve);
                     } else {
-                        resolve({ duration: 60, error: `HTTP ${res.statusCode}` });
+                        console.error(`❌ Invalid response: HTTP ${res.statusCode}, Content-Type: ${res.headers['content-type'] || 'undefined'}`);
+                        resolve({ duration: 60, error: `HTTP ${res.statusCode} - Invalid content type or status` });
                     }
                 });
                 testRequest.on('error', (error) => {
                     console.error('❌ URL test failed:', error.message);
                     resolve({ duration: 60, error: error.message });
                 });
-                testRequest.setTimeout(15000, () => { // FIX: Increased timeout to 15s
+                testRequest.setTimeout(15000, () => {
                     console.error('⏰ URL test timeout');
                     testRequest.destroy();
                     resolve({ duration: 60, error: 'Timeout' });
@@ -113,15 +115,19 @@ const analyzeVideo = async (url, retries = 3) => {
         }
         if (attempt < retries) await new Promise(resolve => setTimeout(resolve, 2000));
     }
+    // Try local fallback if both URLs fail and it's the fallback URL attempt
+    if (!isPrimary && fs.existsSync(LOCAL_FALLBACK_PATH)) {
+        console.log(`🔄 Trying local fallback: ${LOCAL_FALLBACK_PATH}`);
+        return await analyzeVideo(LOCAL_FALLBACK_PATH, 1, false);
+    }
     return { duration: 60, error: 'All retries failed' };
 };
 
 const runFFprobe = (url, resolve) => {
-    // FIX: Simplified FFprobe command to reduce crash likelihood
     const timeout = setTimeout(() => {
         console.log('⏰ FFprobe timeout after 20 seconds');
         resolve({ duration: 60, error: 'FFprobe timeout' });
-    }, 20000); // FIX: Increased timeout to 20s
+    }, 20000);
 
     ffmpeg.ffprobe(url, ['-show_streams', '-show_format', '-print_format json'], (err, metadata) => {
         clearTimeout(timeout);
@@ -142,7 +148,7 @@ const runFFprobe = (url, resolve) => {
                 }
             }
             resolve({
-                duration: metadata.format.duration || 60, // FIX: Fallback duration
+                duration: metadata.format.duration || 60,
                 metadata: metadata,
                 error: null
             });
@@ -170,12 +176,12 @@ const runFFprobe = (url, resolve) => {
     });
     console.log(`✅ Test pattern created: ${lastPixels.length} pixels`);
     
-    // FIX: Try primary URL, then fallback
+    // Try MediaFire URL, then fallback, then local file
     videoInfo = await analyzeVideo(PRIMARY_VIDEO_URL);
     if (videoInfo.error) {
         console.error(`❌ Primary video analysis failed: ${videoInfo.error}`);
         console.log(`🔄 Trying fallback URL: ${FALLBACK_VIDEO_URL}`);
-        videoInfo = await analyzeVideo(FALLBACK_VIDEO_URL);
+        videoInfo = await analyzeVideo(FALLBACK_VIDEO_URL, 3, false);
     }
     
     videoDuration = videoInfo.duration;
@@ -185,8 +191,7 @@ const runFFprobe = (url, resolve) => {
     } else {
         console.log(`⏱️ Video Duration: ${videoDuration}s`);
         console.log(`🎬 Total frames: ${Math.floor(videoDuration * FPS)}`);
-        // FIX: Use the successful URL for processing
-        const activeUrl = videoInfo.metadata ? PRIMARY_VIDEO_URL : FALLBACK_VIDEO_URL;
+        const activeUrl = videoInfo.metadata ? (fs.existsSync(LOCAL_FALLBACK_PATH) && !PRIMARY_VIDEO_URL.includes('gtv-videos-bucket') && !FALLBACK_VIDEO_URL.includes('gtv-videos-bucket') ? LOCAL_FALLBACK_PATH : PRIMARY_VIDEO_URL) : FALLBACK_VIDEO_URL;
         if (activeUrl && activeUrl !== 'https://your-video-url-here.mp4') {
             startProcessing(activeUrl);
             console.log('✅ Video processing started!');
@@ -255,7 +260,7 @@ const processFrameWithDebug = (videoUrl, seekTime) => {
                 console.log(`⏰ Timeout processing frame at ${seekTime}s`);
                 reject(new Error('Processing timeout'));
             }
-        }, 15000); // FIX: Increased timeout to 15s
+        }, 15000);
         
         outputStream.on('data', chunk => {
             if (!hasCompleted) {
