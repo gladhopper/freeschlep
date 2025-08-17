@@ -14,17 +14,16 @@ ffmpeg.setFfprobePath(ffprobeInstaller.path);
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// Updated: Use MediaFire direct link as primary URL
 const PRIMARY_VIDEO_URL = process.env.VIDEO_URL || 'https://download1530.mediafire.com/3o4juukzcliguYLFJnsadxcJ87DmfrqqK9UVDNhEcz3uYEMSKiqd_2OFp4OLRxXgZtuE7rTBBS0KRDj8nAEtDGGl0nKRM9NGX7oD_txjx0tlINo3JziusbhsaLp7JGOhgZNr4ftm8wQIKFrkZnlYZBzzTRnwDfLWf3vdLDYI56g/y9v8mehyrwd9y4n/h.mp4';
-const FALLBACK_VIDEO_URL = 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4'; // Reliable fallback
-const LOCAL_FALLBACK_PATH = path.join(__dirname, 'fallback.mp4'); // Local file fallback
+const FALLBACK_VIDEO_URL = 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4';
+const LOCAL_FALLBACK_PATH = path.join(__dirname, 'fallback.mp4');
 
 const FPS = 6;
 const WIDTH = 192;
 const HEIGHT = 144;
 
 let currentFrame = 0;
-let videoDuration = 60; // Default duration if analysis fails
+let videoDuration = 60;
 let lastPixels = [];
 let isProcessing = false;
 let consecutiveErrors = 0;
@@ -77,7 +76,6 @@ app.get('/debug', (req, res) => {
     });
 });
 
-// Enhanced video analysis with retries and fallback
 const analyzeVideo = async (url, retries = 3, isPrimary = true) => {
     for (let attempt = 1; attempt <= retries; attempt++) {
         console.log(`📹 Attempt ${attempt}: Analyzing video URL: ${url}`);
@@ -115,7 +113,6 @@ const analyzeVideo = async (url, retries = 3, isPrimary = true) => {
         }
         if (attempt < retries) await new Promise(resolve => setTimeout(resolve, 2000));
     }
-    // Try local fallback if both URLs fail and it's the fallback URL attempt
     if (!isPrimary && fs.existsSync(LOCAL_FALLBACK_PATH)) {
         console.log(`🔄 Trying local fallback: ${LOCAL_FALLBACK_PATH}`);
         return await analyzeVideo(LOCAL_FALLBACK_PATH, 1, false);
@@ -123,16 +120,19 @@ const analyzeVideo = async (url, retries = 3, isPrimary = true) => {
     return { duration: 60, error: 'All retries failed' };
 };
 
+// FIX: Corrected FFprobe command syntax and added detailed error logging
 const runFFprobe = (url, resolve) => {
     const timeout = setTimeout(() => {
         console.log('⏰ FFprobe timeout after 20 seconds');
         resolve({ duration: 60, error: 'FFprobe timeout' });
     }, 20000);
 
-    ffmpeg.ffprobe(url, ['-show_streams', '-show_format', '-print_format json'], (err, metadata) => {
+    ffmpeg.ffprobe(url, ['-show_streams', '-show_format', '-print_format', 'json'], (err, metadata) => {
         clearTimeout(timeout);
         if (err) {
             console.error('❌ FFprobe failed:', err.message);
+            // FIX: Log full FFprobe error output for debugging
+            console.error('FFprobe error details:', err);
             resolve({ duration: 60, error: err.message });
         } else {
             console.log('✅ Video analysis complete!');
@@ -156,14 +156,12 @@ const runFFprobe = (url, resolve) => {
     });
 };
 
-// Initialize with better debugging
 (async () => {
     console.log('🚀 Starting DEBUG video server...');
     console.log(`📺 Target Resolution: ${WIDTH}x${HEIGHT} (${WIDTH * HEIGHT} pixels)`);
     console.log(`⚡ Target FPS: ${FPS}`);
     console.log(`📊 Expected buffer size: ${WIDTH * HEIGHT * 3} bytes`);
     
-    // Create test pattern first
     console.log('🎨 Creating test pattern...');
     lastPixels = Array(WIDTH * HEIGHT).fill(0).map((_, i) => {
         const x = i % WIDTH;
@@ -176,7 +174,6 @@ const runFFprobe = (url, resolve) => {
     });
     console.log(`✅ Test pattern created: ${lastPixels.length} pixels`);
     
-    // Try MediaFire URL, then fallback, then local file
     videoInfo = await analyzeVideo(PRIMARY_VIDEO_URL);
     if (videoInfo.error) {
         console.error(`❌ Primary video analysis failed: ${videoInfo.error}`);
@@ -199,7 +196,6 @@ const runFFprobe = (url, resolve) => {
     }
 })();
 
-// Enhanced processing with detailed debugging
 const startProcessing = (videoUrl) => {
     let processingActive = false;
     
@@ -242,10 +238,9 @@ const startProcessing = (videoUrl) => {
         processingActive = false;
     };
     
-    setInterval(processNextFrame, 167); // 6 FPS
+    setInterval(processNextFrame, 167);
 };
 
-// Enhanced frame processing with detailed logging
 const processFrameWithDebug = (videoUrl, seekTime) => {
     return new Promise((resolve, reject) => {
         let pixelBuffer = Buffer.alloc(0);
@@ -359,7 +354,6 @@ const processFrameWithDebug = (videoUrl, seekTime) => {
     });
 };
 
-// API endpoints
 app.get('/frame', (req, res) => {
     res.json({
         pixels: lastPixels,
@@ -400,7 +394,6 @@ app.listen(PORT, () => {
     console.log(`🔧 Debug endpoints: /debug, /info, /ping`);
 });
 
-// Self-ping for Render
 if (process.env.NODE_ENV === 'production') {
     setInterval(() => {
         try {
