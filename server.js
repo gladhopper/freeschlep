@@ -11,29 +11,27 @@ ffmpeg.setFfprobePath(ffprobeInstaller.path);
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-
-// Use local s.mp4 in the same directory as server.js
 const VIDEO_PATH = path.join(__dirname, 's.mp4');
 
-const FPS = 10; // Increased from 6 to 10 like your working version
-const WIDTH = 192;
-const HEIGHT = 144;
+// EXACT COPY of your working version but with 192x144
+const FPS = 10;
+const WIDTH = 192;   // Changed from 160 to 192
+const HEIGHT = 144;  // Changed from 120 to 144
 
 let currentFrame = 0;
-let videoDuration = 60;
-let lastPixels = [];
+let videoDuration = 0;
+let lastPixels = []; // SAME as working version - single frame storage
 let isProcessing = false;
 
+// IDENTICAL CORS setup
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type');
     next();
 });
 
-// Simplified video duration check
+// IDENTICAL duration function
 const getVideoDuration = () => {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
         ffmpeg.ffprobe(VIDEO_PATH, (err, metadata) => {
             if (err) {
                 console.warn('ffprobe failed, using fallback duration');
@@ -45,147 +43,63 @@ const getVideoDuration = () => {
     });
 };
 
-// Initialize
+// IDENTICAL initialization
 (async () => {
-    console.log('🚀 Starting FAST video server...');
-    
-    if (!fs.existsSync(VIDEO_PATH)) {
-        console.error(`❌ Video file not found: ${VIDEO_PATH}`);
-        // Create test pattern
-        lastPixels = Array(WIDTH * HEIGHT).fill(0).map((_, i) => {
-            const x = i % WIDTH;
-            const y = Math.floor(i / WIDTH);
-            return [
-                Math.floor((x / WIDTH) * 255),
-                Math.floor((y / HEIGHT) * 255),
-                128
-            ];
-        });
-        console.log('🎨 Using test pattern');
-    } else {
+    try {
         videoDuration = await getVideoDuration();
-        console.log(`📺 Video duration: ${videoDuration}s`);
-        console.log(`🎬 Total frames: ${Math.floor(videoDuration * FPS)}`);
-        console.log(`📊 Resolution: ${WIDTH}x${HEIGHT} (${WIDTH * HEIGHT} pixels)`);
-        console.log(`⚡ Target FPS: ${FPS}`);
-        
-        // Start processing immediately
-        startProcessing();
+        console.log(`Video duration: ${videoDuration}s`);
+        console.log(`Total frames: ${Math.floor(videoDuration * FPS)}`);
+        console.log(`Resolution: ${WIDTH}x${HEIGHT} (${WIDTH * HEIGHT} pixels) - 1:1 Mapping`);
+        console.log(`Target FPS: ${FPS}`);
+    } catch (err) {
+        console.error('Could not get video duration:', err);
+        videoDuration = 60;
     }
 })();
 
-// Simplified, fast processing with timing debug
-const startProcessing = () => {
-    let frameStartTime;
-    let consecutiveErrors = 0;
-    
-    const processFrame = () => {
-        if (isProcessing || !videoDuration) {
-            console.log(`⏸️ Skipping frame - isProcessing: ${isProcessing}, videoDuration: ${videoDuration}`);
-            return;
+// IDENTICAL background processing from working version - NO CHANGES
+setInterval(() => {
+    if (isProcessing || !videoDuration) return;
+   
+    isProcessing = true;
+    const seekTime = currentFrame / FPS;
+    let pixelBuffer = Buffer.alloc(0);
+   
+    const outputStream = new PassThrough();
+   
+    outputStream.on('data', chunk => {
+        pixelBuffer = Buffer.concat([pixelBuffer, chunk]);
+    });
+   
+    outputStream.on('end', () => {
+        const pixels = [];
+        for (let i = 0; i < pixelBuffer.length; i += 3) {
+            pixels.push([pixelBuffer[i], pixelBuffer[i + 1], pixelBuffer[i + 2]]);
         }
-        
-        frameStartTime = Date.now();
-        isProcessing = true;
-        const seekTime = currentFrame / FPS;
-        let pixelBuffer = Buffer.alloc(0);
-        
-        console.log(`🎬 Starting frame ${currentFrame} at ${seekTime.toFixed(2)}s`);
-        
-        const outputStream = new PassThrough();
-        
-        outputStream.on('data', chunk => {
-            pixelBuffer = Buffer.concat([pixelBuffer, chunk]);
-        });
-        
-        outputStream.on('end', () => {
-            try {
-                const pixels = [];
-                for (let i = 0; i < pixelBuffer.length; i += 3) {
-                    if (i + 2 < pixelBuffer.length) {
-                        pixels.push([pixelBuffer[i], pixelBuffer[i + 1], pixelBuffer[i + 2]]);
-                    }
-                }
-                lastPixels = pixels;
-                currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
-                consecutiveErrors = 0;
-                
-                const processingTime = Date.now() - frameStartTime;
-                console.log(`✅ Frame ${currentFrame-1} complete in ${processingTime}ms - ${pixels.length} pixels`);
-                
-            } catch (error) {
-                console.error('Pixel processing error:', error.message);
-                consecutiveErrors++;
-            }
-            isProcessing = false;
-        });
-        
-        outputStream.on('error', (err) => {
-            console.error('Stream error:', err.message);
-            consecutiveErrors++;
-            if (consecutiveErrors > 3) {
-                console.log('🛑 Too many errors, skipping ahead...');
-                currentFrame = (currentFrame + 5) % Math.floor(videoDuration * FPS);
-                consecutiveErrors = 0;
-            }
-            isProcessing = false;
-        });
-        
-        // Add timeout to prevent hanging
-        const timeout = setTimeout(() => {
-            console.log(`⏰ Frame ${currentFrame} timeout after 2 seconds`);
-            isProcessing = false;
-            consecutiveErrors++;
-        }, 2000);
-        
-        // SIMPLIFIED FFMPEG - like your working version
-        ffmpeg(VIDEO_PATH)
-            .seekInput(seekTime)
-            .frames(1)
-            .size(`${WIDTH}x${HEIGHT}`)
-            .outputOptions('-pix_fmt rgb24')  // ONLY essential option
-            .format('rawvideo')
-            .on('error', (err) => {
-                console.error('FFmpeg error:', err.message);
-                clearTimeout(timeout);
-                consecutiveErrors++;
-                isProcessing = false;
-            })
-            .on('end', () => {
-                clearTimeout(timeout);
-            })
-            .pipe(outputStream);
-    };
-    
-    // Start with immediate processing, then set interval
-    processFrame();
-    setInterval(processFrame, 1000 / FPS);
-};
-
-// Status endpoints
-app.get('/', (req, res) => {
-    res.json({
-        status: '✅ FAST Video server running',
-        uptime: Math.floor(process.uptime()),
-        frame: currentFrame,
-        timestamp: currentFrame / FPS,
-        duration: videoDuration,
-        resolution: `${WIDTH}x${HEIGHT}`,
-        fps: FPS,
-        pixelsCount: lastPixels.length,
-        memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
+        lastPixels = pixels;
+        currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
+        isProcessing = false;
+       
+        if (currentFrame % (FPS * 5) === 0) {
+            console.log(`Processed frame ${currentFrame} (${seekTime.toFixed(2)}s)`);
+        }
     });
-});
+   
+    ffmpeg(VIDEO_PATH)
+        .seekInput(seekTime)
+        .frames(1)
+        .size(`${WIDTH}x${HEIGHT}`)
+        .outputOptions('-pix_fmt rgb24')
+        .format('rawvideo')
+        .on('error', (err) => {
+            console.error('FFmpeg error:', err);
+            isProcessing = false;
+        })
+        .pipe(outputStream);
+       
+}, 1000 / FPS);
 
-app.get('/ping', (req, res) => {
-    res.json({
-        pong: true,
-        time: new Date().toISOString(),
-        frame: currentFrame,
-        hasPixels: lastPixels.length > 0
-    });
-});
-
+// IDENTICAL endpoints
 app.get('/frame', (req, res) => {
     res.json({
         pixels: lastPixels,
@@ -197,7 +111,6 @@ app.get('/frame', (req, res) => {
 });
 
 app.get('/info', (req, res) => {
-    const memory = process.memoryUsage();
     res.json({
         currentFrame,
         timestamp: currentFrame / FPS,
@@ -206,19 +119,27 @@ app.get('/info', (req, res) => {
         width: WIDTH,
         height: HEIGHT,
         totalFrames: Math.floor(videoDuration * FPS),
-        isProcessing,
-        pixelCount: lastPixels.length,
-        expectedPixels: WIDTH * HEIGHT,
-        memoryUsage: {
-            heapUsed: Math.round(memory.heapUsed / 1024 / 1024),
-            heapTotal: Math.round(memory.heapTotal / 1024 / 1024)
-        }
+        isProcessing
+    });
+});
+
+app.get('/', (req, res) => {
+    res.json({
+        status: 'Video server running - EXACT WORKING COPY',
+        frame: currentFrame,
+        timestamp: currentFrame / FPS,
+        duration: videoDuration,
+        resolution: `${WIDTH}x${HEIGHT}`,
+        fps: FPS,
+        pixelsCount: lastPixels.length,
+        isProcessing
     });
 });
 
 app.listen(PORT, () => {
-    console.log(`🚀 FAST Video Server running on port ${PORT}`);
-    console.log(`📺 Resolution: ${WIDTH}x${HEIGHT} @ ${FPS}fps`);
+    console.log(`Video pixel server running at port ${PORT}`);
+    console.log(`Resolution: ${WIDTH}x${HEIGHT} (${WIDTH * HEIGHT} pixels)`);
+    console.log(`Target FPS: ${FPS}`);
 });
 
 // Keep-alive for production
