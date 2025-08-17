@@ -4,31 +4,23 @@ const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
 const ffprobeInstaller = require('@ffprobe-installer/ffprobe');
 const fs = require('fs');
 const { PassThrough } = require('stream');
-const path = require('path');
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 ffmpeg.setFfprobePath(ffprobeInstaller.path);
 
 const app = express();
 const PORT = process.env.PORT || 10000;
+const VIDEO_PATH = 'C:/Users/waffles/Downloads/h.mp4';
 
-const VIDEO_PATH = path.join(__dirname, 's.mp4');
-const FPS = 6;
+const FPS = 10; // Target FPS
 const WIDTH = 192;
 const HEIGHT = 144;
 
-// OPTIMIZATION 1: Frame cache to avoid re-processing
-const frameCache = new Map();
-const CACHE_SIZE = 100; // Cache 100 frames (~16 seconds at 6fps)
-
-// OPTIMIZATION 2: Batch processing state
 let currentFrame = 0;
-let videoDuration = 60;
+let videoDuration = 0;
 let lastPixels = [];
 let isProcessing = false;
-let consecutiveErrors = 0;
-let videoInfo = null;
-let batchProcessor = null;
+let actualProcessingTime = 0;
 
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
@@ -37,188 +29,150 @@ app.use((req, res, next) => {
     next();
 });
 
-const analyzeVideo = async (videoPath) => {
-    console.log(`📹 Analyzing video: ${videoPath}`);
-    if (!fs.existsSync(videoPath)) {
-        console.error(`❌ Video file not found: ${videoPath}`);
-        return { duration: 60, error: 'Video file not found' };
-    }
-    
+const getVideoDuration = () => {
     return new Promise((resolve) => {
-        const timeout = setTimeout(() => {
-            resolve({ duration: 60, error: 'FFprobe timeout' });
-        }, 10000);
-
-        ffmpeg.ffprobe(videoPath, (err, metadata) => {
-            clearTimeout(timeout);
+        ffmpeg.ffprobe(VIDEO_PATH, (err, metadata) => {
             if (err) {
-                resolve({ duration: 60, error: err.message });
+                console.warn('ffprobe failed, using fallback duration');
+                resolve(60);
             } else {
-                resolve({
-                    duration: metadata.format.duration || 60,
-                    metadata: metadata,
-                    error: null
-                });
+                resolve(metadata.format.duration);
             }
         });
     });
 };
 
-// OPTIMIZATION 3: Batch process multiple frames at once
-class BatchFrameProcessor {
-    constructor(videoPath, fps, width, height) {
-        this.videoPath = videoPath;
-        this.fps = fps;
-        this.width = width;
-        this.height = height;
-        this.isProcessing = false;
-        this.queue = [];
+// FIX: Only advance frame AFTER processing completes
+const processNextFrame = async () => {
+    if (isProcessing || !videoDuration) {
+        return; // Don't stack processing requests
     }
-
-    async processFrameBatch(startFrame, count = 10) {
-        if (this.isProcessing) return;
-        this.isProcessing = true;
-
-        console.log(`🎬 Batch processing ${count} frames starting from ${startFrame}`);
-
-        try {
-            const startTime = startFrame / this.fps;
-            const frames = await this.extractFrames(startTime, count);
+    
+    isProcessing = true;
+    const seekTime = currentFrame / FPS;
+    const startTime = Date.now();
+    
+    console.log(`🎬 Processing frame ${currentFrame} at ${seekTime.toFixed(2)}s`);
+    
+    try {
+        const pixels = await processFrame(seekTime);
+        
+        if (pixels && pixels.length > 0) {
+            lastPixels = pixels;
+            actualProcessingTime = Date.now() - startTime;
             
-            // Cache all the frames
-            frames.forEach((pixels, index) => {
-                const frameNum = startFrame + index;
-                frameCache.set(frameNum, pixels);
-                
-                // Keep cache size manageable
-                if (frameCache.size > CACHE_SIZE) {
-                    const oldestKey = frameCache.keys().next().value;
-                    frameCache.delete(oldestKey);
-                }
-            });
-
-            console.log(`✅ Cached ${frames.length} frames (cache size: ${frameCache.size})`);
-        } catch (error) {
-            console.error(`❌ Batch processing failed: ${error.message}`);
-        }
-
-        this.isProcessing = false;
-    }
-
-    extractFrames(startTime, count) {
-        return new Promise((resolve, reject) => {
-            let frameData = [];
-            let currentFrameBuffer = Buffer.alloc(0);
-            const expectedFrameSize = this.width * this.height * 3;
-            let framesReceived = 0;
-
-            const outputStream = new PassThrough();
-
-            const timeout = setTimeout(() => {
-                reject(new Error('Batch processing timeout'));
-            }, 30000);
-
-            outputStream.on('data', chunk => {
-                currentFrameBuffer = Buffer.concat([currentFrameBuffer, chunk]);
-                
-                // Check if we have complete frames
-                while (currentFrameBuffer.length >= expectedFrameSize) {
-                    const frameBuffer = currentFrameBuffer.slice(0, expectedFrameSize);
-                    currentFrameBuffer = currentFrameBuffer.slice(expectedFrameSize);
-                    
-                    // Convert frame buffer to pixels
-                    const pixels = [];
-                    for (let i = 0; i < frameBuffer.length; i += 3) {
-                        pixels.push([frameBuffer[i], frameBuffer[i + 1], frameBuffer[i + 2]]);
-                    }
-                    
-                    frameData.push(pixels);
-                    framesReceived++;
-                    
-                    if (framesReceived >= count) {
-                        clearTimeout(timeout);
-                        resolve(frameData);
-                        return;
-                    }
-                }
-            });
-
-            outputStream.on('end', () => {
-                clearTimeout(timeout);
-                resolve(frameData);
-            });
-
-            outputStream.on('error', (error) => {
-                clearTimeout(timeout);
-                reject(error);
-            });
-
-            // OPTIMIZATION 4: More efficient FFmpeg command
-            const command = ffmpeg(this.videoPath)
-                .seekInput(startTime)
-                .frames(count)
-                .size(`${this.width}x${this.height}`)
-                .outputOptions([
-                    '-pix_fmt rgb24',
-                    '-f rawvideo',
-                    '-threads 2',
-                    '-preset ultrafast',
-                    '-an',
-                    '-sws_flags fast_bilinear'
-                ])
-                .on('error', reject);
-                
-            command.pipe(outputStream);
-        });
-    }
-}
-
-// OPTIMIZATION 5: Predictive caching
-const startPredictiveCaching = () => {
-    setInterval(async () => {
-        if (!batchProcessor || batchProcessor.isProcessing) return;
-        
-        // Cache frames ahead of current position
-        const lookahead = 20; // Cache 20 frames ahead
-        const targetFrame = (currentFrame + lookahead) % Math.floor(videoDuration * FPS);
-        
-        // Only process if we don't have this frame cached
-        if (!frameCache.has(targetFrame)) {
-            await batchProcessor.processFrameBatch(targetFrame, 10);
-        }
-    }, 2000); // Check every 2 seconds
-};
-
-const startProcessing = (videoPath) => {
-    batchProcessor = new BatchFrameProcessor(videoPath, FPS, WIDTH, HEIGHT);
-    
-    // Process initial batch
-    batchProcessor.processFrameBatch(0, 30);
-    
-    // Start predictive caching
-    startPredictiveCaching();
-
-    // Frame advancement (much faster now with cache)
-    setInterval(() => {
-        // Check if we have the current frame cached
-        if (frameCache.has(currentFrame)) {
-            lastPixels = frameCache.get(currentFrame);
-            consecutiveErrors = 0;
+            console.log(`✅ Frame ${currentFrame} complete in ${actualProcessingTime}ms`);
+            
+            // Only advance after successful processing
+            currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
         } else {
-            console.log(`⚠️ Cache miss for frame ${currentFrame}`);
-            consecutiveErrors++;
-            
-            // Trigger immediate batch processing for missing frames
-            if (!batchProcessor.isProcessing) {
-                batchProcessor.processFrameBatch(currentFrame, 10);
-            }
+            console.warn(`⚠️ Frame ${currentFrame} failed - skipping`);
+            currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
         }
         
+    } catch (error) {
+        console.error(`❌ Processing failed for frame ${currentFrame}:`, error.message);
+        // Skip problematic frame
         currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
-    }, 1000 / FPS);
+    }
+    
+    isProcessing = false;
+    
+    // FIX: Wait for processing to complete, then schedule next
+    scheduleNextFrame();
 };
 
-// API Endpoints
+// FIX: Adaptive timing based on actual processing speed
+const scheduleNextFrame = () => {
+    // Calculate delay based on target FPS and actual processing time
+    const targetInterval = 1000 / FPS; // e.g., 100ms for 10fps
+    const delay = Math.max(50, targetInterval - actualProcessingTime); // Minimum 50ms delay
+    
+    setTimeout(processNextFrame, delay);
+};
+
+const processFrame = (seekTime) => {
+    return new Promise((resolve, reject) => {
+        let pixelBuffer = Buffer.alloc(0);
+        const outputStream = new PassThrough();
+        
+        const timeout = setTimeout(() => {
+            console.log(`⏰ Timeout for frame at ${seekTime}s`);
+            reject(new Error('Processing timeout'));
+        }, 10000);
+        
+        outputStream.on('data', chunk => {
+            pixelBuffer = Buffer.concat([pixelBuffer, chunk]);
+        });
+        
+        outputStream.on('end', () => {
+            clearTimeout(timeout);
+            
+            const pixels = [];
+            for (let i = 0; i < pixelBuffer.length; i += 3) {
+                pixels.push([pixelBuffer[i], pixelBuffer[i + 1], pixelBuffer[i + 2]]);
+            }
+            
+            resolve(pixels);
+        });
+        
+        outputStream.on('error', (error) => {
+            clearTimeout(timeout);
+            reject(error);
+        });
+        
+        // Optimized FFmpeg command
+        const command = ffmpeg(VIDEO_PATH)
+            .seekInput(seekTime)
+            .frames(1)
+            .size(`${WIDTH}x${HEIGHT}`)
+            .outputOptions([
+                '-pix_fmt rgb24',
+                '-preset ultrafast',
+                '-tune zerolatency',
+                '-threads 1',
+                '-an',
+                '-sws_flags fast_bilinear'
+            ])
+            .format('rawvideo')
+            .on('error', (err) => {
+                clearTimeout(timeout);
+                reject(err);
+            });
+            
+        command.pipe(outputStream);
+    });
+};
+
+// Initialize
+(async () => {
+    try {
+        videoDuration = await getVideoDuration();
+        console.log(`✅ Video: ${videoDuration}s, ${Math.floor(videoDuration * FPS)} frames`);
+        
+        // Create fallback pattern
+        lastPixels = Array(WIDTH * HEIGHT).fill(0).map((_, i) => {
+            const x = i % WIDTH;
+            const y = Math.floor(i / WIDTH);
+            return [
+                Math.floor((x / WIDTH) * 255),
+                Math.floor((y / HEIGHT) * 255),
+                128
+            ];
+        });
+        
+        console.log(`🚀 Starting adaptive processing at ${FPS}fps target`);
+        
+        // Start the processing chain
+        processNextFrame();
+        
+    } catch (err) {
+        console.error('Initialization failed:', err);
+        videoDuration = 60;
+    }
+})();
+
+// API endpoints
 app.get('/frame', (req, res) => {
     res.json({
         pixels: lastPixels,
@@ -226,37 +180,28 @@ app.get('/frame', (req, res) => {
         timestamp: currentFrame / FPS,
         width: WIDTH,
         height: HEIGHT,
-        cached: frameCache.has(currentFrame),
-        cacheSize: frameCache.size,
-        errors: consecutiveErrors
+        isProcessing: isProcessing,
+        processingTimeMs: actualProcessingTime,
+        actualFPS: actualProcessingTime > 0 ? (1000 / actualProcessingTime).toFixed(1) : 'N/A'
     });
 });
 
 app.get('/info', (req, res) => {
+    const actualFPS = actualProcessingTime > 0 ? 1000 / actualProcessingTime : 0;
+    
     res.json({
         currentFrame,
         timestamp: currentFrame / FPS,
         duration: videoDuration,
-        fps: FPS,
+        targetFPS: FPS,
+        actualFPS: actualFPS.toFixed(1),
         width: WIDTH,
         height: HEIGHT,
         totalFrames: Math.floor(videoDuration * FPS),
-        cacheSize: frameCache.size,
-        cacheHitRate: frameCache.has(currentFrame) ? '100%' : '0%',
-        isProcessing: batchProcessor?.isProcessing || false,
-        consecutiveErrors,
-        memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
-    });
-});
-
-app.get('/cache-status', (req, res) => {
-    const cachedFrames = Array.from(frameCache.keys()).sort((a, b) => a - b);
-    res.json({
-        cacheSize: frameCache.size,
-        cachedFrames: cachedFrames.slice(0, 20), // Show first 20
-        currentFrame,
-        nextCached: cachedFrames.find(f => f > currentFrame),
-        isProcessing: batchProcessor?.isProcessing || false
+        isProcessing,
+        avgProcessingTime: actualProcessingTime + 'ms',
+        status: isProcessing ? 'Processing...' : 'Ready',
+        pixelCount: lastPixels.length
     });
 });
 
@@ -264,55 +209,29 @@ app.get('/ping', (req, res) => {
     res.json({
         pong: true,
         frame: currentFrame,
-        cached: frameCache.has(currentFrame),
-        cacheSize: frameCache.size
+        isProcessing,
+        uptime: Math.floor(process.uptime())
     });
 });
 
 app.get('/', (req, res) => {
+    const actualFPS = actualProcessingTime > 0 ? (1000 / actualProcessingTime).toFixed(1) : 'N/A';
+    
     res.json({
-        status: '✅ OPTIMIZED Video server running!',
-        uptime: Math.floor(process.uptime()),
+        status: '📺 Adaptive Video Server',
         frame: currentFrame,
-        resolution: `${WIDTH}x${HEIGHT}`,
-        fps: FPS,
-        cacheSize: frameCache.size,
-        optimization: 'Batch processing + Frame cache',
-        memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
+        targetFPS: FPS,
+        actualFPS: actualFPS,
+        processing: isProcessing ? 'Active' : 'Ready',
+        uptime: Math.floor(process.uptime()) + 's',
+        resolution: `${WIDTH}x${HEIGHT}`
     });
 });
 
-// Initialize
-(async () => {
-    console.log('🚀 Starting OPTIMIZED video server...');
-    
-    // Create test pattern as fallback
-    lastPixels = Array(WIDTH * HEIGHT).fill(0).map((_, i) => {
-        const x = i % WIDTH;
-        const y = Math.floor(i / WIDTH);
-        return [
-            Math.floor((x / WIDTH) * 255),
-            Math.floor((y / HEIGHT) * 255),
-            Math.floor(((x + y) / (WIDTH + HEIGHT)) * 255)
-        ];
-    });
-
-    videoInfo = await analyzeVideo(VIDEO_PATH);
-    videoDuration = videoInfo.duration;
-    
-    if (videoInfo.error) {
-        console.error(`❌ Video error: ${videoInfo.error}`);
-        console.log('🎨 Using test pattern only');
-    } else {
-        console.log(`✅ Video loaded: ${videoDuration}s`);
-        startProcessing(VIDEO_PATH);
-    }
-})();
-
 app.listen(PORT, () => {
-    console.log(`🚀 OPTIMIZED Video Server on port ${PORT}`);
-    console.log(`📺 ${WIDTH}x${HEIGHT} @ ${FPS}fps`);
-    console.log(`⚡ Optimizations: Frame cache + Batch processing`);
+    console.log(`🚀 Adaptive Video Server on port ${PORT}`);
+    console.log(`📺 Target: ${WIDTH}x${HEIGHT} @ ${FPS}fps`);
+    console.log(`⚡ Adaptive timing prevents frame stacking`);
 });
 
 if (process.env.NODE_ENV === 'production') {
