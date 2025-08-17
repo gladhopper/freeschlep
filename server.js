@@ -15,7 +15,7 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 
 const PRIMARY_VIDEO_URL = process.env.VIDEO_URL || 'https://download1530.mediafire.com/3o4juukzcliguYLFJnsadxcJ87DmfrqqK9UVDNhEcz3uYEMSKiqd_2OFp4OLRxXgZtuE7rTBBS0KRDj8nAEtDGGl0nKRM9NGX7oD_txjx0tlINo3JziusbhsaLp7JGOhgZNr4ftm8wQIKFrkZnlYZBzzTRnwDfLWf3vdLDYI56g/y9v8mehyrwd9y4n/h.mp4';
-const FALLBACK_VIDEO_URL = 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4';
+const FALLBACK_VIDEO_URL = 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4'; // FIX: Switched to BigBuckBunny.mp4 for reliable fallback
 const LOCAL_FALLBACK_PATH = path.join(__dirname, 'fallback.mp4');
 
 const FPS = 6;
@@ -120,19 +120,18 @@ const analyzeVideo = async (url, retries = 3, isPrimary = true) => {
     return { duration: 60, error: 'All retries failed' };
 };
 
-// FIX: Corrected FFprobe command syntax and added detailed error logging
+// FIX: Added safer FFprobe options and enhanced error logging
 const runFFprobe = (url, resolve) => {
     const timeout = setTimeout(() => {
         console.log('⏰ FFprobe timeout after 20 seconds');
         resolve({ duration: 60, error: 'FFprobe timeout' });
     }, 20000);
 
-    ffmpeg.ffprobe(url, ['-show_streams', '-show_format', '-print_format', 'json'], (err, metadata) => {
+    ffmpeg.ffprobe(url, ['-v', 'error', '-show_streams', '-show_format', '-print_format', 'json'], (err, metadata) => {
         clearTimeout(timeout);
         if (err) {
             console.error('❌ FFprobe failed:', err.message);
-            // FIX: Log full FFprobe error output for debugging
-            console.error('FFprobe error details:', err);
+            console.error('FFprobe error details:', JSON.stringify(err, null, 2));
             resolve({ duration: 60, error: err.message });
         } else {
             console.log('✅ Video analysis complete!');
