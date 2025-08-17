@@ -14,17 +14,16 @@ const PORT = process.env.PORT || 10000;
 
 const VIDEO_URL = process.env.VIDEO_URL || 'https://files.catbox.moe/4ajlnv.mp4';
 
-// Your preferred quality settings
-const FPS = 6;  // Perfect for smooth playback with less processing
-const WIDTH = 192;   // Higher horizontal resolution
-const HEIGHT = 144;  // Higher vertical resolution
+const FPS = 6;
+const WIDTH = 192;
+const HEIGHT = 144;
 
 let currentFrame = 0;
 let videoDuration = 0;
 let lastPixels = [];
 let isProcessing = false;
 let consecutiveErrors = 0;
-let processingQueue = [];
+let videoInfo = null;
 
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
@@ -35,7 +34,7 @@ app.use((req, res, next) => {
 
 app.get('/', (req, res) => {
     res.json({
-        status: '✅ Video server running (Quality Mode)',
+        status: '✅ Video server running (Debug Mode)',
         uptime: Math.floor(process.uptime()),
         frame: currentFrame,
         timestamp: currentFrame / FPS,
@@ -43,7 +42,9 @@ app.get('/', (req, res) => {
         duration: videoDuration,
         errors: consecutiveErrors,
         resolution: `${WIDTH}x${HEIGHT}`,
-        memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
+        memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+        videoInfo: videoInfo ? 'Loaded' : 'Failed',
+        pixelsCount: lastPixels.length
     });
 });
 
@@ -51,70 +52,152 @@ app.get('/ping', (req, res) => {
     res.json({ 
         pong: true, 
         time: new Date().toISOString(),
-        frame: currentFrame
+        frame: currentFrame,
+        errors: consecutiveErrors,
+        hasPixels: lastPixels.length > 0
     });
 });
 
-// Optimized video duration check
-const getVideoDuration = () => {
+app.get('/debug', (req, res) => {
+    res.json({
+        videoUrl: VIDEO_URL,
+        videoInfo: videoInfo,
+        currentFrame: currentFrame,
+        duration: videoDuration,
+        consecutiveErrors: consecutiveErrors,
+        isProcessing: isProcessing,
+        pixelDataLength: lastPixels.length,
+        expectedPixels: WIDTH * HEIGHT,
+        memoryUsage: process.memoryUsage()
+    });
+});
+
+// Enhanced video analysis with better error handling
+const analyzeVideo = () => {
     return new Promise((resolve) => {
-        console.log(`📹 Analyzing video: ${VIDEO_URL}`);
+        console.log(`📹 Analyzing video URL: ${VIDEO_URL}`);
+        console.log(`🔍 Testing URL accessibility...`);
         
-        const timeout = setTimeout(() => {
-            resolve(60);
-        }, 10000);
+        // Test if URL is accessible first
+        const https = require('https');
+        const http = require('http');
+        const client = VIDEO_URL.startsWith('https') ? https : http;
         
-        ffmpeg.ffprobe(VIDEO_URL, (err, metadata) => {
-            clearTimeout(timeout);
-            if (err) {
-                console.warn('⚠️  Using fallback duration');
-                resolve(60);
+        const testRequest = client.request(VIDEO_URL.replace(/\?.*/, ''), { method: 'HEAD' }, (res) => {
+            console.log(`📡 URL Response: ${res.statusCode} ${res.statusMessage}`);
+            console.log(`📦 Content-Type: ${res.headers['content-type']}`);
+            console.log(`📏 Content-Length: ${res.headers['content-length']}`);
+            
+            if (res.statusCode === 200) {
+                console.log('✅ URL is accessible, analyzing with FFprobe...');
+                runFFprobe(resolve);
             } else {
-                console.log('✅ Video loaded successfully');
-                resolve(metadata.format.duration);
+                console.error('❌ URL not accessible:', res.statusCode);
+                resolve({ duration: 60, error: `HTTP ${res.statusCode}` });
             }
         });
+        
+        testRequest.on('error', (error) => {
+            console.error('❌ URL test failed:', error.message);
+            resolve({ duration: 60, error: error.message });
+        });
+        
+        testRequest.setTimeout(10000, () => {
+            console.error('⏰ URL test timeout');
+            testRequest.destroy();
+            resolve({ duration: 60, error: 'Timeout' });
+        });
+        
+        testRequest.end();
     });
 };
 
-// Initialize 
-(async () => {
-    console.log('🚀 Starting HIGH QUALITY video server...');
-    console.log(`📺 Resolution: ${WIDTH}x${HEIGHT} (${WIDTH * HEIGHT} pixels) - FULL QUALITY!`);
-    console.log(`⚡ FPS: ${FPS} (optimized for stability)`);
+const runFFprobe = (resolve) => {
+    const timeout = setTimeout(() => {
+        console.log('⏰ FFprobe timeout after 15 seconds');
+        resolve({ duration: 60, error: 'FFprobe timeout' });
+    }, 15000);
     
-    // Create nice gradient test pattern
+    ffmpeg.ffprobe(VIDEO_URL, {timeout: 10}, (err, metadata) => {
+        clearTimeout(timeout);
+        
+        if (err) {
+            console.error('❌ FFprobe failed:', err.message);
+            resolve({ duration: 60, error: err.message });
+        } else {
+            console.log('✅ Video analysis complete!');
+            console.log(`   Duration: ${metadata.format.duration}s`);
+            console.log(`   Format: ${metadata.format.format_name}`);
+            console.log(`   Size: ${metadata.format.size} bytes`);
+            
+            if (metadata.streams && metadata.streams[0]) {
+                const videoStream = metadata.streams.find(s => s.codec_type === 'video');
+                if (videoStream) {
+                    console.log(`   Video: ${videoStream.width}x${videoStream.height}`);
+                    console.log(`   Codec: ${videoStream.codec_name}`);
+                    console.log(`   FPS: ${videoStream.r_frame_rate}`);
+                }
+            }
+            
+            resolve({
+                duration: metadata.format.duration,
+                metadata: metadata,
+                error: null
+            });
+        }
+    });
+};
+
+// Initialize with better debugging
+(async () => {
+    console.log('🚀 Starting DEBUG video server...');
+    console.log(`📺 Target Resolution: ${WIDTH}x${HEIGHT} (${WIDTH * HEIGHT} pixels)`);
+    console.log(`⚡ Target FPS: ${FPS}`);
+    console.log(`📊 Expected buffer size: ${WIDTH * HEIGHT * 3} bytes`);
+    
+    // Create test pattern first
+    console.log('🎨 Creating test pattern...');
     lastPixels = Array(WIDTH * HEIGHT).fill(0).map((_, i) => {
         const x = i % WIDTH;
         const y = Math.floor(i / WIDTH);
         return [
             Math.floor((x / WIDTH) * 255),
             Math.floor((y / HEIGHT) * 255), 
-            150
+            Math.floor(((x + y) / (WIDTH + HEIGHT)) * 255)
         ];
     });
+    console.log(`✅ Test pattern created: ${lastPixels.length} pixels`);
     
-    videoDuration = await getVideoDuration();
-    console.log(`⏱️  Duration: ${videoDuration}s`);
-    console.log(`🎬 Total frames: ${Math.floor(videoDuration * FPS)}`);
+    // Analyze video
+    videoInfo = await analyzeVideo();
+    videoDuration = videoInfo.duration;
     
-    if (VIDEO_URL && VIDEO_URL !== 'https://your-video-url-here.mp4') {
-        startOptimizedProcessing();
-        console.log('✅ HIGH QUALITY processing started!');
+    if (videoInfo.error) {
+        console.error(`❌ Video analysis failed: ${videoInfo.error}`);
+        console.log('🎨 Will use test pattern only');
+    } else {
+        console.log(`⏱️  Video Duration: ${videoDuration}s`);
+        console.log(`🎬 Total frames: ${Math.floor(videoDuration * FPS)}`);
+        
+        if (VIDEO_URL && VIDEO_URL !== 'https://your-video-url-here.mp4') {
+            startProcessing();
+            console.log('✅ Video processing started!');
+        }
     }
 })();
 
-// Smart processing with memory management
-const startOptimizedProcessing = () => {
+// Enhanced processing with detailed debugging
+const startProcessing = () => {
     let processingActive = false;
     
     const processNextFrame = async () => {
-        if (processingActive || consecutiveErrors > 8) {
-            if (consecutiveErrors > 8) {
-                // Reset errors after waiting
+        if (processingActive || consecutiveErrors > 5) {
+            if (consecutiveErrors > 5) {
+                console.log('🛑 Too many consecutive errors, pausing...');
                 setTimeout(() => {
-                    consecutiveErrors = Math.max(0, consecutiveErrors - 3);
-                }, 5000);
+                    consecutiveErrors = 0;
+                    console.log('🔄 Resetting error count, resuming...');
+                }, 10000);
             }
             return;
         }
@@ -122,58 +205,60 @@ const startOptimizedProcessing = () => {
         processingActive = true;
         const seekTime = currentFrame / FPS;
         
+        console.log(`🎞️  Processing frame ${currentFrame} at ${seekTime.toFixed(2)}s...`);
+        
         try {
-            const pixels = await processFrame(seekTime);
+            const pixels = await processFrameWithDebug(seekTime);
             
             if (pixels && pixels.length > 0) {
                 lastPixels = pixels;
-                consecutiveErrors = Math.max(0, consecutiveErrors - 1); // Reduce errors on success
-                
-                // Log progress every 5 seconds
-                if (currentFrame % (FPS * 5) === 0) {
-                    console.log(`🎞️  Frame ${currentFrame} (${seekTime.toFixed(1)}s) - ${pixels.length} pixels`);
-                }
+                consecutiveErrors = 0;
+                console.log(`✅ Frame ${currentFrame} success: ${pixels.length} pixels`);
+            } else {
+                console.warn(`⚠️  Frame ${currentFrame} returned no pixels`);
+                consecutiveErrors++;
             }
             
             currentFrame = (currentFrame + 1) % Math.floor(videoDuration * FPS);
             
         } catch (error) {
-            console.error(`❌ Processing error: ${error.message}`);
+            console.error(`❌ Frame ${currentFrame} failed: ${error.message}`);
             consecutiveErrors++;
             
-            // Skip problematic frames
-            if (consecutiveErrors > 3) {
-                currentFrame = (currentFrame + FPS) % Math.floor(videoDuration * FPS);
-                console.log(`⏭️  Skipping to frame ${currentFrame}`);
+            // Skip ahead on repeated failures
+            if (consecutiveErrors > 2) {
+                currentFrame = (currentFrame + FPS * 2) % Math.floor(videoDuration * FPS);
+                console.log(`⏭️  Skipping to frame ${currentFrame} due to errors`);
             }
         }
         
         processingActive = false;
     };
     
-    // Process frames every 167ms (6 FPS)
-    setInterval(processNextFrame, 167);
+    setInterval(processNextFrame, 167); // 6 FPS
 };
 
-// Optimized frame processing function
-const processFrame = (seekTime) => {
+// Enhanced frame processing with detailed logging
+const processFrameWithDebug = (seekTime) => {
     return new Promise((resolve, reject) => {
         let pixelBuffer = Buffer.alloc(0);
         let hasCompleted = false;
+        let bytesReceived = 0;
         
         const outputStream = new PassThrough();
         
-        // Aggressive timeout to prevent hanging
         const timeout = setTimeout(() => {
             if (!hasCompleted) {
                 hasCompleted = true;
+                console.log(`⏰ Timeout processing frame at ${seekTime}s`);
                 reject(new Error('Processing timeout'));
             }
-        }, 8000);
+        }, 12000); // Longer timeout for debugging
         
         outputStream.on('data', chunk => {
             if (!hasCompleted) {
                 pixelBuffer = Buffer.concat([pixelBuffer, chunk]);
+                bytesReceived += chunk.length;
             }
         });
         
@@ -182,15 +267,21 @@ const processFrame = (seekTime) => {
             hasCompleted = true;
             clearTimeout(timeout);
             
+            const expectedSize = WIDTH * HEIGHT * 3;
+            console.log(`📊 Buffer info: received ${pixelBuffer.length} bytes, expected ${expectedSize}`);
+            
+            if (pixelBuffer.length === 0) {
+                console.error('❌ Empty buffer - FFmpeg produced no output');
+                reject(new Error('Empty buffer from FFmpeg'));
+                return;
+            }
+            
+            if (pixelBuffer.length !== expectedSize) {
+                console.warn(`⚠️  Size mismatch: got ${pixelBuffer.length}, expected ${expectedSize}`);
+            }
+            
             try {
                 const pixels = [];
-                const expectedSize = WIDTH * HEIGHT * 3;
-                
-                if (pixelBuffer.length !== expectedSize) {
-                    console.warn(`⚠️  Buffer size mismatch: got ${pixelBuffer.length}, expected ${expectedSize}`);
-                }
-                
-                // Process with bounds checking
                 for (let i = 0; i < pixelBuffer.length && i < expectedSize; i += 3) {
                     if (i + 2 < pixelBuffer.length) {
                         pixels.push([
@@ -201,9 +292,11 @@ const processFrame = (seekTime) => {
                     }
                 }
                 
+                console.log(`✅ Processed ${pixels.length} pixels from ${pixelBuffer.length} bytes`);
                 resolve(pixels);
                 
             } catch (error) {
+                console.error('❌ Pixel processing error:', error.message);
                 reject(error);
             }
         });
@@ -212,41 +305,54 @@ const processFrame = (seekTime) => {
             if (!hasCompleted) {
                 hasCompleted = true;
                 clearTimeout(timeout);
+                console.error('❌ Output stream error:', error.message);
                 reject(error);
             }
         });
         
-        // Optimized FFmpeg command for memory efficiency
+        // FFmpeg command with extra debugging
         try {
-            ffmpeg(VIDEO_URL)
+            console.log(`🎬 Starting FFmpeg for frame at ${seekTime}s...`);
+            
+            const command = ffmpeg(VIDEO_URL)
                 .seekInput(seekTime)
                 .frames(1)
                 .size(`${WIDTH}x${HEIGHT}`)
                 .outputOptions([
                     '-pix_fmt rgb24',
-                    '-threads 1',           // Single thread
-                    '-preset ultrafast',    // Fastest processing
-                    '-tune zerolatency',    // Low latency
-                    '-an',                  // No audio
-                    '-sws_flags bilinear',  // Faster scaling
-                    '-f rawvideo'           // Raw output format
+                    '-threads 1',
+                    '-preset ultrafast',
+                    '-tune zerolatency',
+                    '-an',
+                    '-sws_flags bilinear',
+                    '-f rawvideo',
+                    '-avoid_negative_ts make_zero'  // Handle timestamp issues
                 ])
-                .on('start', () => {
-                    // Frame processing started
+                .on('start', (cmd) => {
+                    console.log(`🎬 FFmpeg started: seeking to ${seekTime}s`);
+                })
+                .on('stderr', (stderrLine) => {
+                    // Log important FFmpeg messages
+                    if (stderrLine.includes('Error') || stderrLine.includes('failed')) {
+                        console.log(`FFmpeg: ${stderrLine}`);
+                    }
                 })
                 .on('error', (err) => {
                     if (!hasCompleted) {
                         hasCompleted = true;
                         clearTimeout(timeout);
+                        console.error('❌ FFmpeg error:', err.message);
                         reject(err);
                     }
-                })
-                .pipe(outputStream);
+                });
+            
+            command.pipe(outputStream);
                 
         } catch (error) {
             if (!hasCompleted) {
                 hasCompleted = true;
                 clearTimeout(timeout);
+                console.error('❌ FFmpeg setup error:', error.message);
                 reject(error);
             }
         }
@@ -261,7 +367,7 @@ app.get('/frame', (req, res) => {
         timestamp: currentFrame / FPS,
         width: WIDTH,
         height: HEIGHT,
-        quality: 'HIGH'
+        errors: consecutiveErrors
     });
 });
 
@@ -278,38 +384,25 @@ app.get('/info', (req, res) => {
         isProcessing,
         videoUrl: VIDEO_URL,
         consecutiveErrors,
+        pixelCount: lastPixels.length,
+        expectedPixels: WIDTH * HEIGHT,
+        videoInfo: videoInfo,
         memoryUsage: {
             heapUsed: Math.round(memory.heapUsed / 1024 / 1024),
-            heapTotal: Math.round(memory.heapTotal / 1024 / 1024),
-            external: Math.round(memory.external / 1024 / 1024)
-        },
-        quality: 'HIGH_RESOLUTION'
+            heapTotal: Math.round(memory.heapTotal / 1024 / 1024)
+        }
     });
 });
 
 app.listen(PORT, () => {
-    console.log(`🚀 HIGH QUALITY Video Server running on port ${PORT}`);
-    console.log(`📺 Full resolution: ${WIDTH}x${HEIGHT} @ ${FPS}fps`);
-    console.log(`💎 Quality preserved!`);
+    console.log(`🚀 DEBUG Video Server running on port ${PORT}`);
+    console.log(`📺 Resolution: ${WIDTH}x${HEIGHT} @ ${FPS}fps`);
+    console.log(`🔧 Debug endpoints: /debug, /info, /ping`);
 });
 
-// Memory cleanup and self-ping
+// Self-ping for Render
 if (process.env.NODE_ENV === 'production') {
-    // Aggressive memory cleanup
     setInterval(() => {
-        const usage = process.memoryUsage();
-        const heapMB = Math.round(usage.heapUsed / 1024 / 1024);
-        
-        if (heapMB > 450) {
-            console.log(`🧹 Memory cleanup: ${heapMB}MB`);
-            if (global.gc) {
-                global.gc();
-            }
-        }
-    }, 30000); // Every 30 seconds
-    
-    // Self-ping
-    const selfPing = () => {
         try {
             const url = process.env.RENDER_EXTERNAL_URL;
             if (url) {
@@ -318,6 +411,5 @@ if (process.env.NODE_ENV === 'production') {
         } catch (err) {
             // Silent fail
         }
-    };
-    setInterval(selfPing, 14 * 60 * 1000);
+    }, 14 * 60 * 1000);
 }
