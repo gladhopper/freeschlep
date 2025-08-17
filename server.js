@@ -228,3 +228,141 @@ const processFrameWithDebug = (videoPath, seekTime) => {
             if (hasCompleted) return;
             hasCompleted = true;
             clearTimeout(timeout);
+
+            const expectedSize = WIDTH * HEIGHT * 3;
+            console.log(`📊 Buffer info: received ${pixelBuffer.length} bytes, expected ${expectedSize}`);
+
+            if (pixelBuffer.length === 0) {
+                console.error('❌ Empty buffer - FFmpeg produced no output');
+                reject(new Error('Empty buffer from FFmpeg'));
+                return;
+            }
+
+            if (pixelBuffer.length !== expectedSize) {
+                console.warn(`⚠️ Size mismatch: got ${pixelBuffer.length}, expected ${expectedSize}`);
+            }
+
+            try {
+                const pixels = [];
+                for (let i = 0; i < pixelBuffer.length && i < expectedSize; i += 3) {
+                    if (i + 2 < pixelBuffer.length) {
+                        pixels.push([
+                            pixelBuffer[i],
+                            pixelBuffer[i + 1],
+                            pixelBuffer[i + 2]
+                        ]);
+                    }
+                }
+                console.log(`✅ Processed ${pixels.length} pixels from ${pixelBuffer.length} bytes`);
+                resolve(pixels);
+            } catch (error) {
+                console.error('❌ Pixel processing error:', error.message);
+                reject(error);
+            }
+        });
+
+        outputStream.on('error', (error) => {
+            if (!hasCompleted) {
+                hasCompleted = true;
+                clearTimeout(timeout);
+                console.error('❌ Output stream error:', error.message);
+                reject(error);
+            }
+        });
+
+        try {
+            console.log(`🎬 Starting FFmpeg for frame at ${seekTime}s...`);
+            const command = ffmpeg(videoPath)
+                .seekInput(seekTime)
+                .frames(1)
+                .size(`${WIDTH}x${HEIGHT}`)
+                .outputOptions([
+                    '-pix_fmt rgb24',
+                    '-threads 1',
+                    '-preset ultrafast',
+                    '-tune zerolatency',
+                    '-an',
+                    '-sws_flags bilinear',
+                    '-f rawvideo',
+                    '-avoid_negative_ts make_zero'
+                ])
+                .on('start', (cmd) => {
+                    console.log(`🎬 FFmpeg started: seeking to ${seekTime}s`);
+                })
+                .on('stderr', (stderrLine) => {
+                    if (stderrLine.includes('Error') || stderrLine.includes('failed')) {
+                        console.log(`FFmpeg: ${stderrLine}`);
+                    }
+                })
+                .on('error', (err) => {
+                    if (!hasCompleted) {
+                        hasCompleted = true;
+                        clearTimeout(timeout);
+                        console.error('❌ FFmpeg error:', err.message);
+                        reject(err);
+                    }
+                });
+            command.pipe(outputStream);
+        } catch (error) {
+            if (!hasCompleted) {
+                hasCompleted = true;
+                clearTimeout(timeout);
+                console.error('❌ FFmpeg setup error:', error.message);
+                reject(error);
+            }
+        }
+    });
+};
+
+app.get('/frame', (req, res) => {
+    res.json({
+        pixels: lastPixels,
+        frame: currentFrame,
+        timestamp: currentFrame / FPS,
+        width: WIDTH,
+        height: HEIGHT,
+        errors: consecutiveErrors
+    });
+});
+
+app.get('/info', (req, res) => {
+    const memory = process.memoryUsage();
+    res.json({
+        currentFrame,
+        timestamp: currentFrame / FPS,
+        duration: videoDuration,
+        fps: FPS,
+        width: WIDTH,
+        height: HEIGHT,
+        totalFrames: Math.floor(videoDuration * FPS),
+        isProcessing,
+        videoPath: VIDEO_PATH,
+        consecutiveErrors,
+        pixelCount: lastPixels.length,
+        expectedPixels: WIDTH * HEIGHT,
+        videoInfo: videoInfo,
+        memoryUsage: {
+            heapUsed: Math.round(memory.heapUsed / 1024 / 1024),
+            heapTotal: Math.round(memory.heapTotal / 1024 / 1024)
+        }
+    });
+});
+
+app.listen(PORT, () => {
+    console.log(`🚀 DEBUG Video Server running on port ${PORT}`);
+    console.log(`📺 Resolution: ${WIDTH}x${HEIGHT} @ ${FPS}fps`);
+    console.log(`🔧 Debug endpoints: /debug, /info, /ping`);
+});
+
+if (process.env.NODE_ENV === 'production') {
+    setInterval(() => {
+        try {
+            const url = process.env.RENDER_EXTERNAL_URL;
+            if (url) {
+                require('https').get(`${url}/ping`);
+            }
+        } catch (err) {
+            // Silent fail
+        }
+    }, 14 * 60 * 1000);
+}
